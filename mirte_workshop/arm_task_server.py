@@ -12,6 +12,8 @@ class ArmControlNode(Node):
         # Create service clients
         self.set_arm_home = self.create_client(Trigger, '/set_arm_home')
         self.set_arm_front = self.create_client(Trigger, '/set_arm_front')
+        self.set_arm_package_1 = self.create_client(Trigger, '/set_arm_package_1')
+        self.set_arm_package_2 = self.create_client(Trigger, '/set_arm_package_2')
         self.gripper_open = self.create_client(Trigger, '/gripper_open')
         self.gripper_close = self.create_client(Trigger, '/gripper_close')
 
