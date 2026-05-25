@@ -29,6 +29,11 @@ setup(
             "arm_task_server.py = mirte_workshop.arm_task_server:main",
             "gripper_server.py = mirte_workshop.gripper_server:main",
             "mirte_keyboard.py = mirte_workshop.mirte_keyboard:main",
+            "arm_joint_controller.py = mirte_workshop.arm_joint_controller:main",
+            "exploration_manager.py = mirte_workshop.exploration_manager:main",
+            "odom_to_tf.py = mirte_workshop.odom_to_tf:main",
+            "scan_filter.py = mirte_workshop.scan_filter:main",
+            "zone_detector.py = mirte_workshop.zone_detector:main",
         ],
     },
 )
