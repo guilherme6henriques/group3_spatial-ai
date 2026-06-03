@@ -6,19 +6,23 @@ finds the Zone A / Zone B markers and Nav2-navigates A↔B for `round_trips`
 round trips, avoiding obstacles via the lidar costmap.  No survey, no
 box_perception, no delivery.
 
-SIM (default):   ros2 launch mirte_navigation shuttle.launch.py
+SIM (default):   ros2 launch mirte_workshop shuttle.launch.py
 REAL ROBOT:      run the robot's own bringup first (camera, lidar /scan, base
                  odom + odom→base_link TF, cmd_vel), then:
-    ros2 launch mirte_navigation shuttle.launch.py \
-        use_sim_time:=false aruco_dict:=DICT_4X4_250 zone_a_id:=104 zone_b_id:=100 \
+    ros2 launch mirte_workshop shuttle.launch.py \
+        use_sim_time:=false provide_sim_tf:=false \
+        aruco_dict:=DICT_4X4_250 zone_a_id:=104 zone_b_id:=100 \
         image_topic:=/camera/color/image_raw camera_info_topic:=/camera/color/camera_info \
-        cmd_vel_topic:=/cmd_vel
+        cmd_vel_topic:=/mirte_base_controller/cmd_vel
+  provide_sim_tf:=false is REQUIRED on hardware: it skips the sim-only odom relay
+  and base_footprint static, and instead publishes the base_link→laser /
+  base_link→camera_link mounts the robot's bringup doesn't (see below).
   (check the real topic names with `ros2 topic list`).
 """
 
 from launch import LaunchDescription
 from launch.actions import TimerAction, DeclareLaunchArgument
-from launch.conditions import IfCondition
+from launch.conditions import IfCondition, UnlessCondition
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
@@ -93,6 +97,29 @@ def generate_launch_description():
              arguments=['/mirte_base_controller/odom', '/odom'],
              output='screen', parameters=[sim],
              condition=IfCondition(provide_sim_tf)),
+
+        # REAL ROBOT ONLY (provide_sim_tf:=false): the robot's minimal bringup
+        # publishes only odom→base_link — it does NOT run robot_state_publisher
+        # with the URDF, so the lidar (`laser`) and camera (`camera_link`) mount
+        # transforms are missing.  Without base_link→laser, SLAM drops every scan
+        # ("Message Filter dropping … queue full") and never maps; without
+        # base_link→camera_link, zone_detector can't transform marker poses to map.
+        # These two statics are composed from mirte_master_description/urdf
+        # (frame_base_joint ∘ lidar chain, and ∘ camera_rgb mount), so they match
+        # what robot_state_publisher would have produced.  In sim Gazebo already
+        # publishes them, hence UnlessCondition(provide_sim_tf).
+        Node(package='tf2_ros', executable='static_transform_publisher',
+             name='base_to_laser_tf',
+             arguments=['--x', '0.1005', '--y', '0.0', '--z', '0.10721',
+                        '--roll', '3.14159', '--pitch', '0.0', '--yaw', '-1.5708',
+                        '--frame-id', 'base_link', '--child-frame-id', 'laser'],
+             output='screen', condition=UnlessCondition(provide_sim_tf)),
+        Node(package='tf2_ros', executable='static_transform_publisher',
+             name='base_to_camera_tf',
+             arguments=['--x', '0.146659', '--y', '-0.0025', '--z', '0.1277',
+                        '--roll', '0.0', '--pitch', '0.0', '--yaw', '0.0',
+                        '--frame-id', 'base_link', '--child-frame-id', 'camera_link'],
+             output='screen', condition=UnlessCondition(provide_sim_tf)),
 
         TimerAction(period=5.0, actions=[
             Node(package='slam_toolbox', executable='sync_slam_toolbox_node',
