@@ -206,6 +206,14 @@ class ZoneDetector(Node):
         if ids is None or len(ids) == 0:
             return
 
+        # DEBUG: what IDs is the camera actually seeing?  Tells us at a glance
+        # whether a "looked at but not found" marker is simply a different ID
+        # than zone_a_id/zone_b_id (or is being misread by the wrong dictionary).
+        self.get_logger().info(
+            f'ArUco detected IDs={sorted(int(x) for x in ids.flatten())} '
+            f'(want A={self._a_id}, B={self._b_id})',
+            throttle_duration_sec=1.0)
+
         for i, marker_id in enumerate(ids.flatten()):
             marker_id = int(marker_id)
             # Only the two ZONE markers are handled here; ignore any other ID.
@@ -217,6 +225,10 @@ class ZoneDetector(Node):
 
             pose_map = self._to_map_pose(rvec, tvec, msg.header.stamp)
             if pose_map is None:
+                # Detected a zone marker but couldn't place it in map — TF gap.
+                self.get_logger().warn(
+                    f'Marker {marker_id} seen but map transform failed '
+                    f'(cam frame "{self._cam_frame}").', throttle_duration_sec=2.0)
                 continue
 
             px = pose_map.pose.position.x
