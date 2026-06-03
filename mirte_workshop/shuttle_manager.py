@@ -158,17 +158,26 @@ class ShuttleManager(Node):
             return None
 
     def _relocate_target(self):
-        """A new search vantage: `relocate_dist` away from the robot, at a
-        heading that fans out each attempt so it explores instead of pacing."""
+        """A new search vantage that is actually reachable: fan out across
+        headings and accept the first one whose target cell is clear AND has
+        clear line-of-sight from the robot — so we never fling a blind goal into
+        a wall.  Prefer the full `relocate_dist`, but take a shorter clear hop if
+        that's all that's open.  Returns None if boxed in (→ caller keeps
+        spinning)."""
         p = self._robot_pose()
         if p is None:
             return None
         x, y, yaw = p
-        offsets = [0.0, math.radians(70), math.radians(-70), math.radians(150)]
-        h = yaw + offsets[self._relocate_k % len(offsets)]
+        offsets = [0, 70, -70, 35, -35, 140, -140, 110, -110, 180]
+        start = self._relocate_k
         self._relocate_k += 1
-        d = self._relocate_dist
-        return (x + d * math.cos(h), y + d * math.sin(h), h)
+        for oi in range(len(offsets)):
+            h = yaw + math.radians(offsets[(start + oi) % len(offsets)])
+            for d in (self._relocate_dist, 1.0, 0.6):
+                tx, ty = x + d * math.cos(h), y + d * math.sin(h)
+                if self._has_clearance(tx, ty, 0.35) and self._has_los(x, y, tx, ty):
+                    return (tx, ty, h)
+        return None
 
     # ── main FSM ───────────────────────────────────────────────────────────
     def _tick(self):
