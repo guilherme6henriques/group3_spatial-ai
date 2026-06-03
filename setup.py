@@ -14,6 +14,8 @@ setup(
         ('share/' + package_name, ['package.xml']),
         ('share/' + package_name + '/launch', glob('launch/*.py')),
         ('share/' + package_name + '/launch', glob('launch/*.xml')),
+        ('share/' + package_name + '/params', glob('params/*.yaml')),
+        ('share/' + package_name + '/trees', glob('trees/*.xml')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -34,6 +36,8 @@ setup(
             "odom_to_tf.py = mirte_workshop.odom_to_tf:main",
             "scan_filter.py = mirte_workshop.scan_filter:main",
             "zone_detector.py = mirte_workshop.zone_detector:main",
+            "box_perception.py = mirte_workshop.box_perception:main",
+            "shuttle_manager.py = mirte_workshop.shuttle_manager:main",
         ],
     },
 )

@@ -1,16 +1,29 @@
 #!/usr/bin/env python3
 """
-Zone detector — identifies Zone A (red tape) and Zone B (blue tape) from the
-Orbbec RGB camera during explore_lite exploration.
+Zone detector — locates Zone A and Zone B using ArUco markers.
 
-Each detected tape pixel's centroid is projected onto the ground plane (z=0 in map
-frame) using the full TF chain and the pinhole camera model.  Zone centres are smoothed
-with an exponential moving average so a handful of noisy frames don't distort the
-estimate.
+  Marker ID=0  DICT_4X4_50  →  Zone A pole entrance  →  /zone_a_pose
+  Marker ID=1  DICT_4X4_50  →  Zone B stand centre   →  /zone_b_pose
+  Any other ID              →  ignored
 
-Publishes:
-  /zone_a_pose  (geometry_msgs/PoseStamped, frame: map) — red-tape zone centre
-  /zone_b_pose  (geometry_msgs/PoseStamped, frame: map) — blue-tape zone centre
+The pickup boxes carry NO markers (they're short floor objects that get
+grasped/stacked, so a marker can't be mounted on them) — they are perceived
+geometrically by box_perception.py from the depth camera.
+
+Each detection:
+  1. estimatePoseSingleMarkers gives tvec/rvec in camera frame using the
+     physical zone-marker size.
+  2. TF transforms the marker position and orientation to map frame.
+  3. Position is EMA-smoothed; orientation is taken from the most recent frame.
+  4. The PoseStamped orientation encodes the marker's facing direction (+Z in
+     its own frame) so navigation can compute approach waypoints.
+  5. All poses are re-published at PUBLISH_RATE_HZ even between detections.
+
+Requires:
+  cv2.aruco (OpenCV 4.5.4 old API — Dictionary_get / DetectorParameters_create)
+  /camera/camera_info  →  fills camera_matrix and dist_coeffs
+  /camera/image_raw    →  BGR8 image for detection
+  TF: map ← ... ← camera_optical_frame
 """
 
 import math
@@ -22,6 +35,7 @@ from rclpy.duration import Duration
 import rclpy.time
 
 import tf2_ros
+from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import PoseStamped
 
@@ -32,35 +46,62 @@ try:
 except ImportError:
     _CV = False
 
+# ── ArUco config ──────────────────────────────────────────────────────────────
+MARKER_DICT      = cv2.aruco.DICT_4X4_50 if _CV else None
+ZONE_MARKER_IDS  = frozenset({0, 1})
+ZONE_MARKER_SIZE = 0.20   # physical side length in metres — ID 0, 1
 
-# ── HSV colour ranges (OpenCV convention: H 0-179, S/V 0-255) ────────────────
-# Red tape: ambient (0.85, 0.10, 0.10) → BGR (26, 26, 217) → H≈0, S≈224, V≈217
-RED_LOWER1 = np.array([  0, 100,  80], dtype=np.uint8)
-RED_UPPER1 = np.array([ 15, 255, 255], dtype=np.uint8)
-RED_LOWER2 = np.array([160, 100,  80], dtype=np.uint8)
-RED_UPPER2 = np.array([179, 255, 255], dtype=np.uint8)
+# EMA smoothing factor for position (lower = smoother, slower to converge)
+EMA_ALPHA = 0.20
 
-# Blue tape: ambient (0.10, 0.20, 0.85) → BGR (217, 51, 26) → H≈116, S≈224, V≈217
-BLUE_LOWER = np.array([ 95, 100,  80], dtype=np.uint8)
-BLUE_UPPER = np.array([135, 255, 255], dtype=np.uint8)
+# Re-publish rate even when no new detection arrives
+PUBLISH_RATE_HZ = 5.0
 
-# Minimum blob pixel area to be considered a real tape detection
-MIN_BLOB_PIXELS = 50
 
-# EMA smoothing factor — lower = more smoothing, slower convergence
-EMA_ALPHA = 0.15
-
-# How far above floor the tape surface is (z = 0 = floor, tape is 3 mm thick)
-TAPE_Z = 0.003
-
-# Re-publish detected zones at this rate even when no new detection arrives
-PUBLISH_RATE_HZ = 2.0
-
+# ── Quaternion helpers ────────────────────────────────────────────────────────
 
 def _quat_rotate(qx, qy, qz, qw, v):
-    """Rotate 3-vector v by quaternion (qx, qy, qz, qw)."""
     t = 2.0 * np.cross([qx, qy, qz], v)
     return v + qw * t + np.cross([qx, qy, qz], t)
+
+
+def _quat_to_matrix(qx, qy, qz, qw):
+    x, y, z, w = qx, qy, qz, qw
+    return np.array([
+        [1-2*(y*y+z*z),   2*(x*y-z*w),   2*(x*z+y*w)],
+        [  2*(x*y+z*w), 1-2*(x*x+z*z),   2*(y*z-x*w)],
+        [  2*(x*z-y*w),   2*(y*z+x*w), 1-2*(x*x+y*y)],
+    ], dtype=np.float64)
+
+
+def _matrix_to_quat(R):
+    trace = R[0, 0] + R[1, 1] + R[2, 2]
+    if trace > 0:
+        s = 0.5 / math.sqrt(trace + 1.0)
+        w = 0.25 / s
+        x = (R[2, 1] - R[1, 2]) * s
+        y = (R[0, 2] - R[2, 0]) * s
+        z = (R[1, 0] - R[0, 1]) * s
+    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+        s = 2.0 * math.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2])
+        w = (R[2, 1] - R[1, 2]) / s
+        x = 0.25 * s
+        y = (R[0, 1] + R[1, 0]) / s
+        z = (R[0, 2] + R[2, 0]) / s
+    elif R[1, 1] > R[2, 2]:
+        s = 2.0 * math.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2])
+        w = (R[0, 2] - R[2, 0]) / s
+        x = (R[0, 1] + R[1, 0]) / s
+        y = 0.25 * s
+        z = (R[1, 2] + R[2, 1]) / s
+    else:
+        s = 2.0 * math.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1])
+        w = (R[1, 0] - R[0, 1]) / s
+        x = (R[0, 2] + R[2, 0]) / s
+        y = (R[1, 2] + R[2, 1]) / s
+        z = 0.25 * s
+    n = math.sqrt(x*x + y*y + z*z + w*w)
+    return x/n, y/n, z/n, w/n
 
 
 class ZoneDetector(Node):
@@ -70,108 +111,137 @@ class ZoneDetector(Node):
 
         if not _CV:
             self.get_logger().error(
-                'cv_bridge / opencv-python not found — zone detection disabled.')
+                'cv_bridge / opencv not found — zone detection disabled.')
+            return
 
-        self._bridge  = CvBridge() if _CV else None
+        self._bridge = CvBridge()
 
-        # Camera intrinsics (filled from camera_info)
-        self._fx = self._fy = self._ppx = self._ppy = None
+        # Marker config as ROS params so the SAME node works in sim (ids 0/1,
+        # DICT_4X4_50) and on the real robot (e.g. ids 104/100, DICT_4X4_250).
+        dict_name = self.declare_parameter('aruco_dict', 'DICT_4X4_50').value
+        self._a_id = int(self.declare_parameter('zone_a_id', 0).value)
+        self._b_id = int(self.declare_parameter('zone_b_id', 1).value)
+        self._marker_size = float(
+            self.declare_parameter('zone_marker_size', ZONE_MARKER_SIZE).value)
+
+        a = cv2.aruco
+        dict_id = getattr(a, dict_name)
+        try:
+            self._aruco_dict = a.getPredefinedDictionary(dict_id)   # works on 4.5 & 4.7+
+        except AttributeError:
+            self._aruco_dict = a.Dictionary_get(dict_id)
+        if hasattr(a, 'ArucoDetector'):            # OpenCV >= 4.7 (new API)
+            self._detector = a.ArucoDetector(self._aruco_dict, a.DetectorParameters())
+            self._new_aruco_api = True
+        else:                                      # OpenCV 4.5 / 4.6 (old API)
+            self._aruco_params = a.DetectorParameters_create()
+            self._new_aruco_api = False
+        self.get_logger().info(
+            f'ArUco dict={dict_name}, Zone A=id{self._a_id}, Zone B=id{self._b_id}, '
+            f'size={self._marker_size} m, api={"new" if self._new_aruco_api else "old"}')
+
+        self._camera_matrix: np.ndarray | None = None
+        self._dist_coeffs:   np.ndarray | None = None
         self._cam_frame: str = ''
 
-        # TF
         self._tf_buf      = tf2_ros.Buffer()
         self._tf_listener = tf2_ros.TransformListener(self._tf_buf, self)
 
-        # Smoothed zone centres (None until first detection)
-        self._zone_a: tuple | None = None   # (cx, cy) in map frame
-        self._zone_b: tuple | None = None
+        # Zone poses
+        self._zone_a_xy:   tuple | None = None
+        self._zone_b_xy:   tuple | None = None
+        self._zone_a_quat: tuple | None = None
+        self._zone_b_quat: tuple | None = None
 
         # Publishers
         self._pub_a = self.create_publisher(PoseStamped, '/zone_a_pose', 10)
         self._pub_b = self.create_publisher(PoseStamped, '/zone_b_pose', 10)
 
-        # Subscribers
+        # Cameras publish with SensorData QoS (BEST_EFFORT); a default RELIABLE
+        # subscriber silently gets nothing from them (esp. on the real robot),
+        # so subscribe with sensor QoS to match any camera.
         self.create_subscription(CameraInfo, '/camera/camera_info',
-                                 self._camera_info_cb, 10)
+                                 self._camera_info_cb, qos_profile_sensor_data)
         self.create_subscription(Image, '/camera/image_raw',
-                                 self._image_cb, 10)
+                                 self._image_cb, qos_profile_sensor_data)
 
         self.create_timer(1.0 / PUBLISH_RATE_HZ, self._publish_zones)
 
-        self.get_logger().info('Zone detector started — watching for red and blue tape.')
+        self.get_logger().info(
+            'Zone detector started — IDs 0,1 are zone markers; '
+            'all other detected IDs are treated as box markers.')
 
     # ── Camera intrinsics ─────────────────────────────────────────────────────
 
     def _camera_info_cb(self, msg: CameraInfo):
-        if self._fx is not None:
-            return  # only need to read once
-        k = msg.k          # row-major 3×3 intrinsic matrix
-        self._fx  = k[0]
-        self._fy  = k[4]
-        self._ppx = k[2]
-        self._ppy = k[5]
-        self._cam_frame = msg.header.frame_id
+        if self._camera_matrix is not None:
+            return
+        k = np.array(msg.k, dtype=np.float64).reshape(3, 3)
+        d = np.array(msg.d, dtype=np.float64)
+        self._camera_matrix = k
+        self._dist_coeffs   = d
+        self._cam_frame     = msg.header.frame_id
         self.get_logger().info(
-            f'Camera intrinsics: fx={self._fx:.1f} fy={self._fy:.1f} '
-            f'pp=({self._ppx:.1f},{self._ppy:.1f}) frame="{self._cam_frame}"')
+            f'Camera intrinsics loaded: fx={k[0,0]:.1f} fy={k[1,1]:.1f} '
+            f'frame="{self._cam_frame}"')
 
     # ── Image processing ──────────────────────────────────────────────────────
 
     def _image_cb(self, msg: Image):
-        if not _CV or self._bridge is None:
+        if self._camera_matrix is None:
             return
-        if self._fx is None:
-            return  # no intrinsics yet
-
         try:
             bgr = self._bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         except Exception as exc:
-            self.get_logger().warn(f'cv_bridge error: {exc}', throttle_duration_sec=5.0)
+            self.get_logger().warn(f'cv_bridge: {exc}', throttle_duration_sec=5.0)
             return
 
-        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        if self._new_aruco_api:
+            corners, ids, _ = self._detector.detectMarkers(gray)
+        else:
+            corners, ids, _ = cv2.aruco.detectMarkers(
+                gray, self._aruco_dict, parameters=self._aruco_params)
 
-        # Red mask (wraps around H=0)
-        red_mask = (cv2.inRange(hsv, RED_LOWER1, RED_UPPER1)
-                    | cv2.inRange(hsv, RED_LOWER2, RED_UPPER2))
+        if ids is None or len(ids) == 0:
+            return
 
-        # Blue mask
-        blue_mask = cv2.inRange(hsv, BLUE_LOWER, BLUE_UPPER)
-
-        for mask, color in ((red_mask, 'a'), (blue_mask, 'b')):
-            pt = self._blob_centroid(mask)
-            if pt is None:
+        for i, marker_id in enumerate(ids.flatten()):
+            marker_id = int(marker_id)
+            # Only the two ZONE markers are handled here; ignore any other ID.
+            if marker_id not in (self._a_id, self._b_id):
                 continue
-            u, v = pt
-            world_xy = self._project_to_ground(u, v, msg.header.stamp)
-            if world_xy is None:
+            rvec, tvec, _ = cv2.aruco.estimatePoseSingleMarkers(
+                [corners[i]], self._marker_size, self._camera_matrix, self._dist_coeffs)
+            rvec, tvec = rvec[0], tvec[0]   # unwrap batch dimension
+
+            pose_map = self._to_map_pose(rvec, tvec, msg.header.stamp)
+            if pose_map is None:
                 continue
-            cx, cy = world_xy
-            if color == 'a':
-                self._zone_a = self._ema(self._zone_a, cx, cy)
-            else:
-                self._zone_b = self._ema(self._zone_b, cx, cy)
 
-    def _blob_centroid(self, mask):
-        """Return (u, v) centroid of the largest blob in mask, or None."""
-        nnz = int(np.count_nonzero(mask))
-        if nnz < MIN_BLOB_PIXELS:
-            return None
-        # Find largest connected component
-        n, labels, stats, centroids = cv2.connectedComponentsWithStats(mask)
-        if n < 2:
-            return None
-        # Skip label 0 (background)
-        best = max(range(1, n), key=lambda i: stats[i, cv2.CC_STAT_AREA])
-        if stats[best, cv2.CC_STAT_AREA] < MIN_BLOB_PIXELS:
-            return None
-        return float(centroids[best][0]), float(centroids[best][1])
+            px = pose_map.pose.position.x
+            py = pose_map.pose.position.y
+            qx = pose_map.pose.orientation.x
+            qy = pose_map.pose.orientation.y
+            qz = pose_map.pose.orientation.z
+            qw = pose_map.pose.orientation.w
 
-    def _project_to_ground(self, u, v, stamp):
-        """
-        Project image pixel (u, v) to the ground plane (z = TAPE_Z in map frame).
-        Returns (cx, cy) in map frame, or None if ray doesn't reach the ground.
-        """
+            if marker_id == self._a_id:
+                self._zone_a_xy   = self._ema(self._zone_a_xy, px, py)
+                self._zone_a_quat = (qx, qy, qz, qw)
+                self.get_logger().info(
+                    f'Zone A marker detected → map ({px:.2f}, {py:.2f})',
+                    throttle_duration_sec=2.0)
+            elif marker_id == self._b_id:
+                self._zone_b_xy   = self._ema(self._zone_b_xy, px, py)
+                self._zone_b_quat = (qx, qy, qz, qw)
+                self.get_logger().info(
+                    f'Zone B marker detected → map ({px:.2f}, {py:.2f})',
+                    throttle_duration_sec=2.0)
+
+    # ── Coordinate transform ──────────────────────────────────────────────────
+
+    def _to_map_pose(self, rvec, tvec, stamp) -> PoseStamped | None:
         if not self._cam_frame:
             return None
         try:
@@ -182,44 +252,35 @@ class ZoneDetector(Node):
         except Exception:
             return None
 
-        # Camera position in map frame
-        tx = tf.transform.translation.x
-        ty = tf.transform.translation.y
-        tz = tf.transform.translation.z
+        ctx = tf.transform.translation.x
+        cty = tf.transform.translation.y
+        ctz = tf.transform.translation.z
+        cqx = tf.transform.rotation.x
+        cqy = tf.transform.rotation.y
+        cqz = tf.transform.rotation.z
+        cqw = tf.transform.rotation.w
 
-        # Ray direction in camera optical frame (z forward, x right, y down)
-        ray_cam = np.array([
-            (u - self._ppx) / self._fx,
-            (v - self._ppy) / self._fy,
-            1.0,
-        ])
-        ray_cam /= np.linalg.norm(ray_cam)
+        mc  = tvec.flatten().astype(np.float64)
+        p_w = _quat_rotate(cqx, cqy, cqz, cqw, mc) + np.array([ctx, cty, ctz])
 
-        # Rotate ray into map frame
-        qx = tf.transform.rotation.x
-        qy = tf.transform.rotation.y
-        qz = tf.transform.rotation.z
-        qw = tf.transform.rotation.w
-        ray_world = _quat_rotate(qx, qy, qz, qw, ray_cam)
+        R_marker_cam, _ = cv2.Rodrigues(rvec.flatten())
+        R_cam_map       = _quat_to_matrix(cqx, cqy, cqz, cqw)
+        R_marker_map    = R_cam_map @ R_marker_cam
+        qx, qy, qz, qw  = _matrix_to_quat(R_marker_map)
 
-        # Intersect ray with z = TAPE_Z plane
-        # P = (tx, ty, tz) + t * ray_world,  P.z = TAPE_Z
-        # t = (TAPE_Z - tz) / ray_world[2]
-        if abs(ray_world[2]) < 1e-6:
-            return None
-        t = (TAPE_Z - tz) / ray_world[2]
-        if t <= 0:
-            return None  # intersection is behind the camera
+        p = PoseStamped()
+        p.header.frame_id    = 'map'
+        p.header.stamp       = stamp
+        p.pose.position.x    = float(p_w[0])
+        p.pose.position.y    = float(p_w[1])
+        p.pose.position.z    = float(p_w[2])
+        p.pose.orientation.x = float(qx)
+        p.pose.orientation.y = float(qy)
+        p.pose.orientation.z = float(qz)
+        p.pose.orientation.w = float(qw)
+        return p
 
-        gx = tx + t * ray_world[0]
-        gy = ty + t * ray_world[1]
-
-        # Sanity: projected point must be at a plausible distance (<10 m)
-        dist = math.hypot(gx - tx, gy - ty)
-        if dist > 10.0:
-            return None
-
-        return gx, gy
+    # ── EMA smoothing ─────────────────────────────────────────────────────────
 
     def _ema(self, current, cx, cy):
         if current is None:
@@ -231,19 +292,24 @@ class ZoneDetector(Node):
 
     def _publish_zones(self):
         now = self.get_clock().now().to_msg()
-        if self._zone_a is not None:
-            self._pub_a.publish(self._make_pose(self._zone_a, now))
-        if self._zone_b is not None:
-            self._pub_b.publish(self._make_pose(self._zone_b, now))
+        if self._zone_a_xy is not None and self._zone_a_quat is not None:
+            self._pub_a.publish(
+                self._make_pose(self._zone_a_xy, self._zone_a_quat, now))
+        if self._zone_b_xy is not None and self._zone_b_quat is not None:
+            self._pub_b.publish(
+                self._make_pose(self._zone_b_xy, self._zone_b_quat, now))
 
-    def _make_pose(self, xy, stamp):
+    def _make_pose(self, xy, quat, stamp) -> PoseStamped:
         p = PoseStamped()
         p.header.frame_id    = 'map'
         p.header.stamp       = stamp
         p.pose.position.x    = xy[0]
         p.pose.position.y    = xy[1]
         p.pose.position.z    = 0.0
-        p.pose.orientation.w = 1.0
+        p.pose.orientation.x = quat[0]
+        p.pose.orientation.y = quat[1]
+        p.pose.orientation.z = quat[2]
+        p.pose.orientation.w = quat[3]
         return p
 
 

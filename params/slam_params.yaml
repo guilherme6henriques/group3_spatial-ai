@@ -1,0 +1,28 @@
+slam_toolbox:
+  ros__parameters:
+    use_sim_time: true
+    mode: "mapping"
+    resolution: 0.02
+    map_update_interval: 1.0
+    use_scan_matching: true
+    map_topic: /map
+    scan_topic: /scan_filtered
+
+    # TF frame names — base_footprint matches the static TF chain:
+    # odom → base_link (from planar_move) → base_footprint (from static TF)
+    base_frame: base_link      # was base_footprint (sim-only synthetic frame); base_link
+                               # exists in both sim and the real robot, and matches Nav2's
+                               # robot_base_frame + shuttle_manager — so no base_footprint needed.
+    odom_frame: odom
+    map_frame: map
+
+    # Transform settings
+    transform_publish_period: 0.02   # 50 Hz map→odom transform
+    transform_timeout: 0.5
+
+    # Scan matching thresholds
+    minimum_travel_distance: 0.05    # metres before adding a new scan
+    minimum_travel_heading: 0.1      # radians before adding a new scan
+    throttle_scans: 1                # process every scan
+
+    debug_logging: false
