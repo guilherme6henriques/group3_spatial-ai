@@ -47,6 +47,9 @@ class ShuttleManager(Node):
         # drive to a fresh vantage and look again (don't spin forever in place).
         self._spin_time     = float(self.declare_parameter('search_spin_time', 17.0).value)
         self._relocate_dist = float(self.declare_parameter('relocate_dist', 1.5).value)
+        # Shorter than goal_timeout: a relocate drive that stalls should give up
+        # quickly and resume spinning, not sit frozen for the full minute.
+        self._relocate_timeout = float(self.declare_parameter('relocate_timeout', 20.0).value)
         cmd_topic           = self.declare_parameter(
             'cmd_vel_topic', '/mirte_base_controller/cmd_vel_unstamped').value
 
@@ -201,9 +204,17 @@ class ShuttleManager(Node):
 
             if self._relocating:
                 # Driving to a fresh vantage; bail to spinning if it stalls.
-                if (now - self._goal_sent_ns) / 1e9 > self._goal_timeout:
+                if (now - self._goal_sent_ns) / 1e9 > self._relocate_timeout:
                     self.get_logger().warn('Relocate timeout — spinning here instead.')
                     self._cancel()
+                    # Reset state HERE rather than waiting for _goal_done: if Nav2
+                    # never honours the cancel (a wedged goal), _goal_done never
+                    # fires, _relocating stays True, _searching stays False, and
+                    # _cmd_cb stops publishing — the robot freezes mid-mission.
+                    self._relocating = False
+                    self._navigating = False
+                    self._searching = True
+                    self._spin_start_ns = now
                 return
 
             if not self._searching:                 # (re)start a spin

@@ -19,10 +19,14 @@ slam_toolbox:
     # Transform settings
     transform_publish_period: 0.02   # 50 Hz map→odom transform
     transform_timeout: 0.5
+    tf_buffer_duration: 30.0         # hold more TF history so late scans still resolve
 
     # Scan matching thresholds
     minimum_travel_distance: 0.05    # metres before adding a new scan
     minimum_travel_heading: 0.1      # radians before adding a new scan
-    throttle_scans: 1                # process every scan
+    # On the real robot's CPU, processing every 10 Hz scan overruns slam_toolbox
+    # ("Message Filter dropping … queue is full").  Process every 2nd scan (~5 Hz)
+    # — plenty for mapping while spinning slowly, and it keeps the queue clear.
+    throttle_scans: 2
 
     debug_logging: false
