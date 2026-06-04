@@ -21,12 +21,21 @@ slam_toolbox:
     transform_timeout: 0.5
     tf_buffer_duration: 30.0         # hold more TF history so late scans still resolve
 
-    # Scan matching thresholds
-    minimum_travel_distance: 0.05    # metres before adding a new scan
-    minimum_travel_heading: 0.1      # radians before adding a new scan
+    # Scan matching thresholds — add graph nodes less often (cheaper optimisation).
+    minimum_travel_distance: 0.2     # metres before adding a new scan
+    minimum_travel_heading: 0.3      # radians before adding a new scan
     # On the real robot's CPU, processing every 10 Hz scan overruns slam_toolbox
-    # ("Message Filter dropping … queue is full").  Process every 3rd scan (~3 Hz)
-    # — plenty for mapping while spinning slowly, and it keeps the queue clear.
+    # ("Message Filter dropping … queue is full").  Process every 3rd scan (~3 Hz).
     throttle_scans: 3
+
+    # ── CPU: the scan-matching pegs one ARM core, so SLAM fell behind, dropped
+    #    scans, and barely grew the map (70x49 ≈ 3.5x2.45 m) — then every Nav2
+    #    goal was "off the global costmap" and planning always failed.  Cut the
+    #    per-scan cost so SLAM keeps up and the map covers the arena.
+    do_loop_closing: false                       # skip the 8 m loop-closure search (not needed for a small A<->B area)
+    correlation_search_space_dimension: 0.3
+    correlation_search_space_resolution: 0.03    # was 0.01 default → ~9x fewer correlation cells per scan
+    correlation_search_space_smear_deviation: 0.03
+    scan_buffer_size: 5                           # keep fewer recent scans in the running matcher
 
     debug_logging: false

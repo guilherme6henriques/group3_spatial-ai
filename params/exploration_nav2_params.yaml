@@ -21,7 +21,7 @@ controller_server:
     min_vel_x: 0.0
     min_speed_xy: 0.0
     min_theta_velocity: 1.0
-    controller_frequency: 10.0
+    controller_frequency: 5.0    # was 10.0 — this SBC can't sustain 10 Hz ("Control loop missed rate")
     controller_plugins: ["FollowPath"]
     FollowPath:
       plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
