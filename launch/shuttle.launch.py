@@ -69,20 +69,19 @@ def generate_launch_description():
     bt_xml = PathJoinSubstitution([
         FindPackageShare('mirte_workshop'), 'trees', 'nav2_minimal_tree.xml'])
 
-    # Force Fast-DDS to UDP-only (no shared memory).  The mirte-ros boot service
-    # owns the /dev/shm SHM segments, so our user-launched nodes can't lock them
-    # ("open_and_lock_file failed") and intra-host service calls fail — which
-    # aborted Nav2's lifecycle bringup and dropped cmd_vel.  Set on ALL our nodes
-    # by making it the first launch action (children inherit the env var).
-    fastdds_profile = PathJoinSubstitution([
-        FindPackageShare('mirte_workshop'), 'config', 'fastdds_udp_only.xml'])
+    # NOTE: DDS transport/discovery is NOT configured here.  On the real robot we
+    # use the MIRTE Fast-DDS *discovery server* (set MIRTE_FASTDDS=true in
+    # ~/.mirte_settings.sh, restart mirte-ros; export MIRTE_FASTDDS=true before
+    # sourcing in this shell).  That routes every participant through one server
+    # on :11811 instead of multicast — the multicast storm (MIRTE_FASTDDS=false,
+    # ~24 participants) was starving /scan and map->odom, so SLAM fell seconds
+    # behind and the costmaps broke.  The discovery-server env hook manages
+    # ROS_DISCOVERY_SERVER + FASTRTPS_DEFAULT_PROFILES_FILE, so we must NOT set a
+    # competing Fast-DDS profile here (an earlier UDP-only band-aid was removed).
 
     sim = {'use_sim_time': use_sim_time}
 
     return LaunchDescription(args + [
-
-        SetEnvironmentVariable('FASTRTPS_DEFAULT_PROFILES_FILE', fastdds_profile),
-        SetEnvironmentVariable('RMW_FASTRTPS_USE_QOS_FROM_XML', '0'),
 
         Node(package='mirte_workshop', executable='scan_filter.py',
              name='scan_filter', output='screen', parameters=[sim]),
