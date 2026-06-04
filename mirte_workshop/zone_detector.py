@@ -36,7 +36,7 @@ import rclpy.time
 
 import tf2_ros
 from rclpy.qos import qos_profile_sensor_data
-from sensor_msgs.msg import Image, CameraInfo
+from sensor_msgs.msg import Image, CompressedImage, CameraInfo
 from geometry_msgs.msg import PoseStamped
 
 try:
@@ -168,8 +168,18 @@ class ZoneDetector(Node):
         # times out).  ~6 Hz is ample to catch a marker during a slow spin.
         self._frame_skip = int(self.declare_parameter('frame_skip', 5).value)
         self._frame_i = 0
-        self.create_subscription(Image, '/camera/image_raw',
-                                 self._image_cb, qos_profile_sensor_data)
+        # Subscribing to the raw 30 Hz image and deserializing every frame costs
+        # ~40% of a CPU core even when we only decode every Nth.  The compressed
+        # (JPEG) stream is ~20x smaller, so receiving it is cheap and we only
+        # cv2.imdecode the frames we actually process.  use_compressed:=true on
+        # the real robot; sim publishes raw, so it defaults false.
+        self._use_compressed = bool(self.declare_parameter('use_compressed', False).value)
+        if self._use_compressed:
+            self.create_subscription(CompressedImage, '/camera/image_raw/compressed',
+                                     self._image_cb_compressed, qos_profile_sensor_data)
+        else:
+            self.create_subscription(Image, '/camera/image_raw',
+                                     self._image_cb, qos_profile_sensor_data)
 
         self.create_timer(1.0 / PUBLISH_RATE_HZ, self._publish_zones)
 
@@ -193,19 +203,35 @@ class ZoneDetector(Node):
 
     # ── Image processing ──────────────────────────────────────────────────────
 
-    def _image_cb(self, msg: Image):
+    def _should_process(self) -> bool:
         if self._camera_matrix is None:
-            return
+            return False
         self._frame_i += 1
-        if self._frame_i % self._frame_skip != 0:
-            return                                  # skip most frames to save CPU
+        return self._frame_i % self._frame_skip == 0   # process every Nth frame
+
+    def _image_cb(self, msg: Image):
+        if not self._should_process():
+            return
         try:
             bgr = self._bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         except Exception as exc:
             self.get_logger().warn(f'cv_bridge: {exc}', throttle_duration_sec=5.0)
             return
+        self._process(cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY), msg.header.stamp)
 
-        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    def _image_cb_compressed(self, msg: CompressedImage):
+        if not self._should_process():
+            return
+        try:
+            bgr = cv2.imdecode(np.frombuffer(msg.data, np.uint8), cv2.IMREAD_COLOR)
+        except Exception as exc:
+            self.get_logger().warn(f'imdecode: {exc}', throttle_duration_sec=5.0)
+            return
+        if bgr is None:
+            return
+        self._process(cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY), msg.header.stamp)
+
+    def _process(self, gray, stamp):
         if self._new_aruco_api:
             corners, ids, _ = self._detector.detectMarkers(gray)
         else:
@@ -232,7 +258,7 @@ class ZoneDetector(Node):
                 [corners[i]], self._marker_size, self._camera_matrix, self._dist_coeffs)
             rvec, tvec = rvec[0], tvec[0]   # unwrap batch dimension
 
-            pose_map = self._to_map_pose(rvec, tvec, msg.header.stamp)
+            pose_map = self._to_map_pose(rvec, tvec, stamp)
             if pose_map is None:
                 # Detected a zone marker but couldn't place it in map — TF gap.
                 self.get_logger().warn(

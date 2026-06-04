@@ -255,6 +255,7 @@ class ShuttleManager(Node):
                 if (now - self._goal_sent_ns) / 1e9 > self._goal_timeout:
                     self.get_logger().warn('Goal timeout — cancelling & retrying.')
                     self._cancel()
+                    self._navigating = False   # re-send next tick (don't spin on a wedged cancel)
                 return
             if self._leg >= len(self._legs):
                 self.get_logger().info('Shuttle complete — all legs done.')

@@ -23,7 +23,7 @@ REAL ROBOT:      run the robot's own bringup first (camera, lidar /scan, base
 from launch import LaunchDescription
 from launch.actions import TimerAction, DeclareLaunchArgument, SetEnvironmentVariable
 from launch.conditions import IfCondition, UnlessCondition
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution, TextSubstitution
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 
@@ -39,6 +39,7 @@ def generate_launch_description():
     image_topic   = LaunchConfiguration('image_topic')
     camera_info_topic = LaunchConfiguration('camera_info_topic')
     provide_sim_tf = LaunchConfiguration('provide_sim_tf')
+    use_compressed = LaunchConfiguration('use_compressed')
 
     args = [
         DeclareLaunchArgument('use_sim_time', default_value='true'),
@@ -55,6 +56,9 @@ def generate_launch_description():
         # REAL robot's own bringup already publishes these (and would conflict),
         # so set provide_sim_tf:=false on hardware.
         DeclareLaunchArgument('provide_sim_tf',    default_value='true'),
+        # Real robot: subscribe to the camera's compressed (JPEG) stream instead
+        # of raw — ~20x less data to deserialize on the SBC.  Sim publishes raw.
+        DeclareLaunchArgument('use_compressed',    default_value='false'),
     ]
 
     nav_params = PathJoinSubstitution([
@@ -89,8 +93,11 @@ def generate_launch_description():
              parameters=[sim, {'aruco_dict': aruco_dict,
                                'zone_a_id': zone_a_id,
                                'zone_b_id': zone_b_id,
-                               'zone_marker_size': zone_marker_size}],
+                               'zone_marker_size': zone_marker_size,
+                               'use_compressed': use_compressed}],
              remappings=[('/camera/image_raw', image_topic),
+                         ('/camera/image_raw/compressed',
+                          [image_topic, TextSubstitution(text='/compressed')]),
                          ('/camera/camera_info', camera_info_topic)]),
 
         Node(package='tf2_ros', executable='static_transform_publisher',
@@ -133,7 +140,11 @@ def generate_launch_description():
              output='screen', condition=UnlessCondition(provide_sim_tf)),
 
         TimerAction(period=5.0, actions=[
-            Node(package='slam_toolbox', executable='sync_slam_toolbox_node',
+            # async (not sync): processes scans in a background thread and drops
+            # gracefully under CPU pressure instead of stalling its callback and
+            # overflowing the scan message-filter queue ("queue is full"), which
+            # was corrupting the map/localisation and making Nav2 goals time out.
+            Node(package='slam_toolbox', executable='async_slam_toolbox_node',
                  name='slam_toolbox', output='screen', parameters=[slam_params, sim]),
         ]),
 
