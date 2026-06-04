@@ -69,7 +69,7 @@ controller_server:
 local_costmap:
   local_costmap:
     ros__parameters:
-      update_frequency: 2.0
+      update_frequency: 1.0        # was 2.0 — lighter on the SBC CPU
       publish_frequency: 1.0
       global_frame: odom
       robot_base_frame: base_link

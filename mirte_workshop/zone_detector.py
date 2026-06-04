@@ -162,6 +162,12 @@ class ZoneDetector(Node):
         # so subscribe with sensor QoS to match any camera.
         self.create_subscription(CameraInfo, '/camera/camera_info',
                                  self._camera_info_cb, qos_profile_sensor_data)
+        # Decode/detect on only every Nth frame.  The orbbec streams ~30 Hz, but
+        # ArUco decode of a 640x480 frame is costly and the SBC also runs SLAM +
+        # Nav2; processing every frame starves Nav2 (its lifecycle activation
+        # times out).  ~6 Hz is ample to catch a marker during a slow spin.
+        self._frame_skip = int(self.declare_parameter('frame_skip', 5).value)
+        self._frame_i = 0
         self.create_subscription(Image, '/camera/image_raw',
                                  self._image_cb, qos_profile_sensor_data)
 
@@ -190,6 +196,9 @@ class ZoneDetector(Node):
     def _image_cb(self, msg: Image):
         if self._camera_matrix is None:
             return
+        self._frame_i += 1
+        if self._frame_i % self._frame_skip != 0:
+            return                                  # skip most frames to save CPU
         try:
             bgr = self._bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         except Exception as exc:

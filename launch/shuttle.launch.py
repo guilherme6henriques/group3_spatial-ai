@@ -126,7 +126,7 @@ def generate_launch_description():
                  name='slam_toolbox', output='screen', parameters=[slam_params, sim]),
         ]),
 
-        TimerAction(period=20.0, actions=[
+        TimerAction(period=35.0, actions=[
             Node(package='nav2_planner', executable='planner_server',
                  name='planner_server', output='screen', parameters=[nav_params, sim]),
             Node(package='nav2_controller', executable='controller_server',
@@ -148,7 +148,7 @@ def generate_launch_description():
                                              'behavior_server', 'bt_navigator']}]),
         ]),
 
-        TimerAction(period=30.0, actions=[
+        TimerAction(period=50.0, actions=[
             Node(package='mirte_workshop', executable='shuttle_manager.py',
                  name='shuttle_manager', output='screen',
                  parameters=[sim, {'round_trips': round_trips,
