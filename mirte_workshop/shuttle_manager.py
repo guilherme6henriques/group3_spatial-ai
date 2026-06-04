@@ -319,7 +319,13 @@ class ShuttleManager(Node):
             self._nav.wait_for_server(timeout_sec=2.0)
         goal = NavigateToPose.Goal()
         goal.pose.header.frame_id = 'map'
-        goal.pose.header.stamp = self.get_clock().now().to_msg()
+        # Stamp 0 = "use the latest transform".  If we stamp with now(), Nav2
+        # looks up the robot pose (base_link->map) at that fixed time; while the
+        # robot sits on a goal it can't finish, the stamp ages out of the ~26 s
+        # TF buffer -> "extrapolation into the past" on every planning attempt ->
+        # the leg can never plan.  The goal is a static point in the map, so the
+        # exact stamp is meaningless; 0 avoids the aging entirely.
+        goal.pose.header.stamp = rclpy.time.Time().to_msg()
         goal.pose.pose.position.x = float(x)
         goal.pose.pose.position.y = float(y)
         goal.pose.pose.orientation.z = math.sin(yaw / 2.0)
