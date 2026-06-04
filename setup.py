@@ -16,6 +16,7 @@ setup(
         ('share/' + package_name + '/launch', glob('launch/*.xml')),
         ('share/' + package_name + '/params', glob('params/*.yaml')),
         ('share/' + package_name + '/trees', glob('trees/*.xml')),
+        ('share/' + package_name + '/config', glob('config/*.xml')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,

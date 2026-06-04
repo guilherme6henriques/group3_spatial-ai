@@ -21,7 +21,7 @@ REAL ROBOT:      run the robot's own bringup first (camera, lidar /scan, base
 """
 
 from launch import LaunchDescription
-from launch.actions import TimerAction, DeclareLaunchArgument
+from launch.actions import TimerAction, DeclareLaunchArgument, SetEnvironmentVariable
 from launch.conditions import IfCondition, UnlessCondition
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
@@ -64,9 +64,20 @@ def generate_launch_description():
     bt_xml = PathJoinSubstitution([
         FindPackageShare('mirte_workshop'), 'trees', 'nav2_minimal_tree.xml'])
 
+    # Force Fast-DDS to UDP-only (no shared memory).  The mirte-ros boot service
+    # owns the /dev/shm SHM segments, so our user-launched nodes can't lock them
+    # ("open_and_lock_file failed") and intra-host service calls fail — which
+    # aborted Nav2's lifecycle bringup and dropped cmd_vel.  Set on ALL our nodes
+    # by making it the first launch action (children inherit the env var).
+    fastdds_profile = PathJoinSubstitution([
+        FindPackageShare('mirte_workshop'), 'config', 'fastdds_udp_only.xml'])
+
     sim = {'use_sim_time': use_sim_time}
 
     return LaunchDescription(args + [
+
+        SetEnvironmentVariable('FASTRTPS_DEFAULT_PROFILES_FILE', fastdds_profile),
+        SetEnvironmentVariable('RMW_FASTRTPS_USE_QOS_FROM_XML', '0'),
 
         Node(package='mirte_workshop', executable='scan_filter.py',
              name='scan_filter', output='screen', parameters=[sim]),
