@@ -24,7 +24,8 @@ from launch import LaunchDescription
 from launch.actions import TimerAction, DeclareLaunchArgument, SetEnvironmentVariable
 from launch.conditions import IfCondition, UnlessCondition
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution, TextSubstitution
-from launch_ros.actions import Node
+from launch_ros.actions import Node, ComposableNodeContainer
+from launch_ros.descriptions import ComposableNode
 from launch_ros.substitutions import FindPackageShare
 
 
@@ -148,26 +149,46 @@ def generate_launch_description():
                  name='slam_toolbox', output='screen', parameters=[slam_params, sim]),
         ]),
 
+        # COMPOSED Nav2: all five servers run in ONE container, sharing a single
+        # DDS participant.  On this robot MIRTE_FASTDDS=false, so ~24 separate
+        # participants (mirte-ros + our stack) flood multicast discovery — it took
+        # 25 s just to discover planner_server/get_state, and the lifecycle
+        # manager's service calls then timed out ("async_send_request failed"),
+        # aborting bringup.  In one container the lifecycle get_state/change_state
+        # calls are intra-process (no DDS discovery), so they can't time out, and
+        # Nav2 contributes 1 participant instead of 5.
         TimerAction(period=35.0, actions=[
-            Node(package='nav2_planner', executable='planner_server',
-                 name='planner_server', output='screen', parameters=[nav_params, sim]),
-            Node(package='nav2_controller', executable='controller_server',
-                 name='controller_server', output='screen', parameters=[nav_params, sim],
-                 remappings=[('cmd_vel', cmd_vel_topic)]),
-            Node(package='nav2_bt_navigator', executable='bt_navigator',
-                 name='bt_navigator', output='screen',
-                 parameters=[nav_params, sim,
-                             {'default_nav_to_pose_bt_xml': bt_xml,
-                              'default_nav_through_poses_bt_xml': bt_xml}]),
-            Node(package='nav2_behaviors', executable='behavior_server',
-                 name='behavior_server', output='screen', parameters=[nav_params, sim],
-                 remappings=[('cmd_vel', cmd_vel_topic)]),
-            Node(package='nav2_lifecycle_manager', executable='lifecycle_manager',
-                 name='lifecycle_manager_navigation', output='screen',
-                 parameters=[{'use_sim_time': use_sim_time, 'autostart': True,
-                              'bond_timeout': 0.0,
-                              'node_names': ['planner_server', 'controller_server',
-                                             'behavior_server', 'bt_navigator']}]),
+            ComposableNodeContainer(
+                name='nav2_container', namespace='',
+                package='rclcpp_components', executable='component_container_isolated',
+                output='screen',
+                parameters=[{'use_sim_time': use_sim_time}],
+                composable_node_descriptions=[
+                    ComposableNode(
+                        package='nav2_planner', plugin='nav2_planner::PlannerServer',
+                        name='planner_server', parameters=[nav_params, sim]),
+                    ComposableNode(
+                        package='nav2_controller', plugin='nav2_controller::ControllerServer',
+                        name='controller_server', parameters=[nav_params, sim],
+                        remappings=[('cmd_vel', cmd_vel_topic)]),
+                    ComposableNode(
+                        package='nav2_behaviors', plugin='behavior_server::BehaviorServer',
+                        name='behavior_server', parameters=[nav_params, sim],
+                        remappings=[('cmd_vel', cmd_vel_topic)]),
+                    ComposableNode(
+                        package='nav2_bt_navigator', plugin='nav2_bt_navigator::BtNavigator',
+                        name='bt_navigator', parameters=[nav_params, sim,
+                            {'default_nav_to_pose_bt_xml': bt_xml,
+                             'default_nav_through_poses_bt_xml': bt_xml}]),
+                    ComposableNode(
+                        package='nav2_lifecycle_manager',
+                        plugin='nav2_lifecycle_manager::LifecycleManager',
+                        name='lifecycle_manager_navigation',
+                        parameters=[{'use_sim_time': use_sim_time, 'autostart': True,
+                                     'bond_timeout': 0.0,
+                                     'node_names': ['planner_server', 'controller_server',
+                                                    'behavior_server', 'bt_navigator']}]),
+                ]),
         ]),
 
         TimerAction(period=50.0, actions=[
