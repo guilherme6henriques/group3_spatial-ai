@@ -9,7 +9,10 @@ REAL ROBOT:
     ros2 launch mirte_workshop point_shuttle.launch.py \
         use_sim_time:=false provide_sim_tf:=false \
         cmd_vel_topic:=/mirte_base_controller/cmd_vel \
-        ax:=1.0 ay:=0.0 bx:=0.0 by:=0.0 round_trips:=3
+        forward_a:=1.0 forward_b:=0.0 round_trips:=3
+    (forward_a/forward_b are metres AHEAD of the start pose along the robot's
+     heading — not absolute map coords — because the SLAM map origin isn't the
+     robot's start.)
 """
 from launch import LaunchDescription
 from launch.actions import TimerAction, DeclareLaunchArgument
@@ -30,10 +33,8 @@ def generate_launch_description():
         DeclareLaunchArgument('cmd_vel_topic',
                               default_value='/mirte_base_controller/cmd_vel_unstamped'),
         DeclareLaunchArgument('provide_sim_tf', default_value='true'),
-        DeclareLaunchArgument('ax', default_value='1.0'),
-        DeclareLaunchArgument('ay', default_value='0.0'),
-        DeclareLaunchArgument('bx', default_value='0.0'),
-        DeclareLaunchArgument('by', default_value='0.0'),
+        DeclareLaunchArgument('forward_a', default_value='1.0'),   # m ahead of start
+        DeclareLaunchArgument('forward_b', default_value='0.0'),   # m ahead of start (0 = start)
         DeclareLaunchArgument('round_trips', default_value='3'),
     ]
 
@@ -105,10 +106,8 @@ def generate_launch_description():
             Node(package='mirte_workshop', executable='point_shuttle.py',
                  name='point_shuttle', output='screen',
                  parameters=[sim, {'cmd_vel_topic': cmd_vel_topic,
-                                   'ax': LaunchConfiguration('ax'),
-                                   'ay': LaunchConfiguration('ay'),
-                                   'bx': LaunchConfiguration('bx'),
-                                   'by': LaunchConfiguration('by'),
+                                   'forward_a': LaunchConfiguration('forward_a'),
+                                   'forward_b': LaunchConfiguration('forward_b'),
                                    'round_trips': LaunchConfiguration('round_trips')}]),
         ]),
     ])

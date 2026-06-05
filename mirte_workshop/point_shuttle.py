@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """
-point_shuttle.py — the simplest possible A<->B test.
+point_shuttle.py — the simplest possible A<->B test, RELATIVE to the start pose.
 
-Drive between two FIXED points in the `map` frame, back and forth, using Nav2.
-No camera, no ArUco, no search/spin — just navigation.  Use this to validate
-SLAM localisation + Nav2 + the base in isolation, BEFORE adding marker detection.
+Drive forward/back along the robot's OWN heading using Nav2.  No camera, no
+ArUco, no search.  Validates SLAM localisation + Nav2 + the base in isolation.
 
-The `map` frame origin is the robot's pose when SLAM starts, so the defaults
-A=(1.0, 0.0), B=(0.0, 0.0) mean "drive 1 m straight ahead, then back to start",
-repeated `round_trips` times.  Override with params, e.g.:
-    ax:=1.5 ay:=0.0 bx:=0.0 by:=0.0 round_trips:=3
+IMPORTANT: the SLAM map origin is NOT the robot's start (wheel odom isn't zeroed
+at launch, so the robot can start at e.g. map (1.2, 0.66, 43 deg)).  So we do NOT
+use absolute map coords — we capture the robot's actual start pose, then place
+the goals `forward_a` / `forward_b` metres ahead ALONG ITS HEADING.  Defaults:
+forward_a=1.0 (1 m straight ahead), forward_b=0.0 (back to the start point).
+That way "forward" is really forward and the robot barely has to rotate on the
+outbound leg (rotation is where mecanum localisation drifts).
 """
+import math
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
@@ -28,10 +31,8 @@ TICK_HZ = 2.0
 class PointShuttle(Node):
     def __init__(self):
         super().__init__('point_shuttle')
-        self._ax = float(self.declare_parameter('ax', 1.0).value)
-        self._ay = float(self.declare_parameter('ay', 0.0).value)
-        self._bx = float(self.declare_parameter('bx', 0.0).value)
-        self._by = float(self.declare_parameter('by', 0.0).value)
+        self._fwd_a = float(self.declare_parameter('forward_a', 1.0).value)
+        self._fwd_b = float(self.declare_parameter('forward_b', 0.0).value)
         self._round_trips  = int(self.declare_parameter('round_trips', 3).value)
         self._goal_timeout = float(self.declare_parameter('goal_timeout', 60.0).value)
         self._slam_wait    = float(self.declare_parameter('slam_wait_timeout', 60.0).value)
@@ -43,9 +44,7 @@ class PointShuttle(Node):
         self._cmd = self.create_publisher(Twist, cmd_topic, 10)
         self._nav = ActionClient(self, NavigateToPose, 'navigate_to_pose')
 
-        # A, B, A, B, …  (one round trip = go to A, then back to B)
-        self._legs = [('A', self._ax, self._ay),
-                      ('B', self._bx, self._by)] * self._round_trips
+        self._legs = []           # built once we know the start pose
         self._leg = 0
         self._state = 'WAIT_SLAM'
         self._navigating = False
@@ -55,16 +54,20 @@ class PointShuttle(Node):
 
         self.create_timer(1.0 / TICK_HZ, self._tick)
         self.get_logger().info(
-            f'point_shuttle up — A=({self._ax:.2f},{self._ay:.2f}) '
-            f'B=({self._bx:.2f},{self._by:.2f}), {self._round_trips} round trips.')
+            f'point_shuttle up — forward_a={self._fwd_a} m, forward_b={self._fwd_b} m '
+            f'(relative to start heading), {self._round_trips} round trips.')
 
-    def _robot_ready(self) -> bool:
+    def _robot_pose(self):
+        """(x, y, yaw) of base_link in map, or None."""
         try:
-            self._tf_buf.lookup_transform('map', 'base_link', rclpy.time.Time(),
-                                          timeout=Duration(seconds=0.1))
-            return True
+            tf = self._tf_buf.lookup_transform('map', 'base_link', rclpy.time.Time(),
+                                               timeout=Duration(seconds=0.1))
         except Exception:
-            return False
+            return None
+        t, q = tf.transform.translation, tf.transform.rotation
+        yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                         1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        return (t.x, t.y, yaw)
 
     def _tick(self):
         now = self.get_clock().now().nanoseconds
@@ -73,8 +76,20 @@ class PointShuttle(Node):
             return
 
         if self._state == 'WAIT_SLAM':
-            if self._robot_ready():
-                self.get_logger().info('SLAM/TF ready — starting point shuttle.')
+            p = self._robot_pose()
+            if p is not None:
+                x0, y0, yaw0 = p
+                ca, sa = math.cos(yaw0), math.sin(yaw0)
+                ax, ay = x0 + self._fwd_a * ca, y0 + self._fwd_a * sa
+                bx, by = x0 + self._fwd_b * ca, y0 + self._fwd_b * sa
+                # Orientation along the travel direction so the robot doesn't do
+                # an extra spin on arrival: A faces forward (yaw0), B faces back.
+                self._legs = [('A', ax, ay, yaw0),
+                              ('B', bx, by, yaw0 + math.pi)] * self._round_trips
+                self.get_logger().info(
+                    f'Start pose map=({x0:.2f}, {y0:.2f}, {math.degrees(yaw0):.0f}°). '
+                    f'A={self._fwd_a} m fwd=({ax:.2f}, {ay:.2f}), '
+                    f'B={self._fwd_b} m fwd=({bx:.2f}, {by:.2f}). Starting.')
                 self._state = 'RUN'
             elif (now - self._start_ns) / 1e9 > self._slam_wait:
                 self.get_logger().error('No map→base_link TF — is SLAM running? Aborting.')
@@ -89,20 +104,20 @@ class PointShuttle(Node):
                 if (now - self._goal_sent_ns) / 1e9 > self._goal_timeout:
                     self.get_logger().warn('Goal timeout — cancelling & retrying.')
                     self._cancel()
-                    self._navigating = False    # re-send next tick
+                    self._navigating = False
                 return
             if self._leg >= len(self._legs):
                 self.get_logger().info('Point shuttle complete — all legs done.')
                 self._state = 'DONE'
                 return
-            name, x, y = self._legs[self._leg]
+            name, x, y, yaw = self._legs[self._leg]
             self.get_logger().info(
                 f'Leg {self._leg + 1}/{len(self._legs)} → {name} ({x:.2f}, {y:.2f})')
-            self._send_goal(x, y)
+            self._send_goal(x, y, yaw)
             return
         # DONE → idle
 
-    def _send_goal(self, x, y):
+    def _send_goal(self, x, y, yaw):
         if not self._nav.server_is_ready():
             self._nav.wait_for_server(timeout_sec=2.0)
         goal = NavigateToPose.Goal()
@@ -110,7 +125,8 @@ class PointShuttle(Node):
         goal.pose.header.stamp = rclpy.time.Time().to_msg()   # 0 = use latest transform
         goal.pose.pose.position.x = float(x)
         goal.pose.pose.position.y = float(y)
-        goal.pose.pose.orientation.w = 1.0
+        goal.pose.pose.orientation.z = math.sin(yaw / 2.0)
+        goal.pose.pose.orientation.w = math.cos(yaw / 2.0)
         self._navigating = True
         self._goal_sent_ns = self.get_clock().now().nanoseconds
         self._nav.send_goal_async(goal).add_done_callback(self._goal_accepted)
