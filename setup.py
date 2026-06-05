@@ -38,6 +38,7 @@ setup(
             "scan_filter.py = mirte_workshop.scan_filter:main",
             "zone_detector.py = mirte_workshop.zone_detector:main",
             "box_perception.py = mirte_workshop.box_perception:main",
+            "point_shuttle.py = mirte_workshop.point_shuttle:main",
             "shuttle_manager.py = mirte_workshop.shuttle_manager:main",
         ],
     },
