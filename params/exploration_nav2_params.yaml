@@ -47,9 +47,15 @@ controller_server:
       # satisfies the goal checker → times out forever → wanders.  Enabling it
       # lets RPP turn in place to the goal heading (and to face a box).
       use_rotate_to_heading: true
-      rotate_to_heading_angular_vel: 1.0
+      # GENTLE rotation: this is a mecanum base whose odometry drifts badly during
+      # fast in-place spins, and the (starved) scan-matcher can't correct it in
+      # time — so a fast spin makes localization diverge from reality (the log
+      # says "Reached A" while the robot actually spun off into a wall).  Slow
+      # spins keep odom in step with scan-matching, like the gentle manual turns
+      # that localized fine in the Step-2 test.
+      rotate_to_heading_angular_vel: 0.4
       rotate_to_heading_min_angle: 0.5
-      max_angular_accel: 3.2
+      max_angular_accel: 1.0
       regulated_linear_scaling_min_radius: 0.3
       regulated_linear_scaling_min_speed: 0.15
       approach_velocity_scaling_dist: 0.5
