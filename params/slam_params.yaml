@@ -4,7 +4,14 @@ slam_toolbox:
     mode: "mapping"
     resolution: 0.05               # was 0.02 — 4x fewer cells, big CPU/RAM win on the SBC
     map_update_interval: 2.0        # was 1.0 — rebuild the map half as often
-    use_scan_matching: true
+    # FALSE on this robot: the SBC can't run scan-matching fast enough, so it
+    # dropped scans and made BAD corrections that jerked map->odom around — a
+    # bolted marker smeared across a 1.5 m circle and Nav2 chased a sliding goal.
+    # The wheel odometry (odom->base_link) is fresh and accurate (~29 ms), so we
+    # trust it: map->odom stays smooth, the marker stays put, and the goal is
+    # stable. Drift over a short A<->B run in a small arena is negligible. This
+    # also drops the per-scan Ceres cost that was pegging a core ("queue is full").
+    use_scan_matching: false
     map_topic: /map
     scan_topic: /scan_filtered
 
