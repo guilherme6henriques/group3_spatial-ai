@@ -39,6 +39,7 @@ setup(
             "zone_detector.py = mirte_workshop.zone_detector:main",
             "box_perception.py = mirte_workshop.box_perception:main",
             "point_shuttle.py = mirte_workshop.point_shuttle:main",
+            "strafe_shuttle.py = mirte_workshop.strafe_shuttle:main",
             "shuttle_manager.py = mirte_workshop.shuttle_manager:main",
         ],
     },
