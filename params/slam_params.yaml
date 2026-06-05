@@ -4,14 +4,14 @@ slam_toolbox:
     mode: "mapping"
     resolution: 0.05               # was 0.02 — 4x fewer cells, big CPU/RAM win on the SBC
     map_update_interval: 2.0        # was 1.0 — rebuild the map half as often
-    # FALSE on this robot: the SBC can't run scan-matching fast enough, so it
-    # dropped scans and made BAD corrections that jerked map->odom around — a
-    # bolted marker smeared across a 1.5 m circle and Nav2 chased a sliding goal.
-    # The wheel odometry (odom->base_link) is fresh and accurate (~29 ms), so we
-    # trust it: map->odom stays smooth, the marker stays put, and the goal is
-    # stable. Drift over a short A<->B run in a small arena is negligible. This
-    # also drops the per-scan Ceres cost that was pegging a core ("queue is full").
-    use_scan_matching: false
+    # TRUE: this base has MECANUM wheels whose odometry drifts badly — especially
+    # rotating in place during the search spin — so pure odometry (false) drifted
+    # and was worse, not better.  We NEED scan-matching to correct mecanum drift.
+    # The SBC has spare CPU (~70% idle; "queue is full" was DDS scan delivery, not
+    # compute), so the fidelity settings below are restored to proper (not
+    # coarsened) values so each processed scan matches well and pulls map->odom
+    # back onto the walls.
+    use_scan_matching: true
     map_topic: /map
     scan_topic: /scan_filtered
 
@@ -28,21 +28,20 @@ slam_toolbox:
     transform_timeout: 0.5
     tf_buffer_duration: 30.0         # hold more TF history so late scans still resolve
 
-    # Scan matching thresholds — add graph nodes less often (cheaper optimisation).
-    minimum_travel_distance: 0.2     # metres before adding a new scan
-    minimum_travel_heading: 0.3      # radians before adding a new scan
-    # On the real robot's CPU, processing every 10 Hz scan overruns slam_toolbox
-    # ("Message Filter dropping … queue is full").  Process every 3rd scan (~3 Hz).
-    throttle_scans: 3
+    # Add graph nodes often enough to actually track motion during the short run.
+    minimum_travel_distance: 0.1     # metres before adding a new scan
+    minimum_travel_heading: 0.2      # radians before adding a new scan
+    # DDS delivery (not CPU) limits scan rate; process every 2nd scan.
+    throttle_scans: 2
 
-    # ── CPU: the scan-matching pegs one ARM core, so SLAM fell behind, dropped
-    #    scans, and barely grew the map (70x49 ≈ 3.5x2.45 m) — then every Nav2
-    #    goal was "off the global costmap" and planning always failed.  Cut the
-    #    per-scan cost so SLAM keeps up and the map covers the arena.
-    do_loop_closing: false                       # skip the 8 m loop-closure search (not needed for a small A<->B area)
-    correlation_search_space_dimension: 0.3
-    correlation_search_space_resolution: 0.03    # was 0.01 default → ~9x fewer correlation cells per scan
-    correlation_search_space_smear_deviation: 0.03
-    scan_buffer_size: 5                           # keep fewer recent scans in the running matcher
+    # Proper scan-matching fidelity (restored from an over-aggressive CPU-saving
+    # coarsening that made matches bad and map->odom jumpy).  The SBC has spare
+    # CPU, and good matches with a WIDE search window are what recover from the
+    # poor mecanum odometry between scans.
+    do_loop_closing: true
+    correlation_search_space_dimension: 0.5
+    correlation_search_space_resolution: 0.01
+    correlation_search_space_smear_deviation: 0.1
+    scan_buffer_size: 10
 
     debug_logging: false
