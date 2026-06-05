@@ -25,16 +25,17 @@ controller_server:
     controller_plugins: ["FollowPath"]
     FollowPath:
       plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
-      # Collision detection MUST stay on for the real robot: with it off the
-      # controller blindly follows the planner's path, so any stale/sparse
-      # costmap or a relocate goal aimed at a wall drives the robot straight
-      # into it (observed on hardware).  Safety > squeezing through tight gaps.
-      use_collision_detection: true
-      # ~0.68 m forward projection at 0.45 m/s — enough room to stop the 0.5 m
-      # robot before contact.
-      max_allowed_time_to_collision_up_to_carrot: 1.5
-      # Slower for hardware bring-up: gives the costmap + collision check time to
-      # react.  Raise once the shuttle is reliable.
+      # FALSE: in the small arena (map ~3.5x2.45 m) the walls are close on every
+      # side, so RPP's forward collision projection sees inflated cost "ahead"
+      # almost everywhere and VETOES every path -> endless abort/backup/wait
+      # thrash, robot never follows a path (Step-3 point_shuttle test).  We turned
+      # this on earlier only because jumpy localization once drove it into a wall;
+      # Step 2 proved localization is now solid, so the costmap is trustworthy and
+      # the global planner already routes around walls via the inflated costmap.
+      # Let the planner keep us safe; don't let the controller veto valid paths.
+      use_collision_detection: false
+      max_allowed_time_to_collision_up_to_carrot: 1.0
+      # Slow for hardware bring-up; raise once the shuttle is reliable.
       desired_linear_vel: 0.25
       lookahead_dist: 0.6
       use_velocity_scaled_lookahead_dist: true
