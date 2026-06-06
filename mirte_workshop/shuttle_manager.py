@@ -277,11 +277,13 @@ class ShuttleManager(Node):
 
     # ── navigation helpers ───────────────────────────────────────────────────
     def _approach(self, target: PoseStamped):
-        """A standoff `approach_dist` from the target that is clear AND has
-        line-of-sight to the target — so a pillar is never between the robot and
-        the tag.  Tries dead-front first (the robot→target bearing), then wider
-        angles around the target, and returns the first clear-LOS one.  Falls
-        back to the plain straight-line standoff if the map isn't ready yet."""
+        """A standoff `approach_dist` from the target, facing it.  ALWAYS returns
+        a waypoint once the marker is known (only None if the robot pose is
+        unknown), so a leg always starts — Nav2's planner does the obstacle
+        avoidance to it.  If the map is available we PREFER a standoff that is
+        clear and has line-of-sight to the marker (so a pillar isn't between
+        robot and tag), but if none is found we fall back to the plain
+        straight-line standoff rather than stalling."""
         r = self._robot_pose()
         if r is None or target is None:
             return None
@@ -289,6 +291,16 @@ class ShuttleManager(Node):
         tx, ty = target.pose.position.x, target.pose.position.y
         d = self._approach_dist
         base = math.atan2(ry - ty, rx - tx)        # target → robot (dead-front)
+
+        # Always-valid default: straight-line standoff `d` from the marker toward
+        # the robot, facing the marker.
+        dr = math.hypot(tx - rx, ty - ry)
+        if dr <= d + 0.05:
+            fallback = (rx, ry, math.atan2(ty - ry, tx - rx))
+        else:
+            ratio = (dr - d) / dr
+            fallback = (rx + ratio * (tx - rx), ry + ratio * (ty - ry),
+                        math.atan2(ty - ry, tx - rx))
 
         if self._map_data is not None:
             # The marker (pole/stand) is itself a lidar obstacle, so check LOS
@@ -304,15 +316,8 @@ class ShuttleManager(Node):
                 ey = ty + (ay - ty) * (los_margin / d)
                 if self._has_clearance(ax, ay, 0.40) and self._has_los(ax, ay, ex, ey):
                     return (ax, ay, math.atan2(ty - ay, tx - ax))   # face the tag
-            return None    # map known but nothing clear yet → retry next tick
 
-        # No map yet: plain straight-line standoff.
-        dr = math.hypot(tx - rx, ty - ry)
-        if dr <= d + 0.05:
-            return (rx, ry, math.atan2(ty - ry, tx - rx))
-        ratio = (dr - d) / dr
-        return (rx + ratio * (tx - rx), ry + ratio * (ty - ry),
-                math.atan2(ty - ry, tx - rx))
+        return fallback   # no clear-LOS standoff found → go straight at it anyway
 
     def _send_goal(self, x, y, yaw):
         if not self._nav.server_is_ready():
