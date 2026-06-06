@@ -6,9 +6,8 @@ Zone detector — locates Zone A and Zone B using ArUco markers.
   Marker ID=1  DICT_4X4_50  →  Zone B stand centre   →  /zone_b_pose
   Any other ID              →  ignored
 
-The pickup boxes carry NO markers (they're short floor objects that get
-grasped/stacked, so a marker can't be mounted on them) — they are perceived
-geometrically by box_perception.py from the depth camera.
+This node detects ONLY the two zone markers (A and B).  The pickup boxes are
+unmarked — they are not this node's concern.
 
 Each detection:
   1. estimatePoseSingleMarkers gives tvec/rvec in camera frame using the
@@ -184,8 +183,8 @@ class ZoneDetector(Node):
         self.create_timer(1.0 / PUBLISH_RATE_HZ, self._publish_zones)
 
         self.get_logger().info(
-            'Zone detector started — IDs 0,1 are zone markers; '
-            'all other detected IDs are treated as box markers.')
+            f'Zone detector started — Zone A=id{self._a_id}, Zone B=id{self._b_id}; '
+            f'any other marker ID is ignored (boxes are unmarked).')
 
     # ── Camera intrinsics ─────────────────────────────────────────────────────
 
