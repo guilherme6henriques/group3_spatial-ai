@@ -41,6 +41,7 @@ def generate_launch_description():
     camera_info_topic = LaunchConfiguration('camera_info_topic')
     provide_sim_tf = LaunchConfiguration('provide_sim_tf')
     use_compressed = LaunchConfiguration('use_compressed')
+    run_zone_detector = LaunchConfiguration('run_zone_detector')
 
     args = [
         DeclareLaunchArgument('use_sim_time', default_value='true'),
@@ -60,6 +61,10 @@ def generate_launch_description():
         # Real robot: subscribe to the camera's compressed (JPEG) stream instead
         # of raw — ~20x less data to deserialize on the SBC.  Sim publishes raw.
         DeclareLaunchArgument('use_compressed',    default_value='false'),
+        # Set false to OFFLOAD zone_detector to the laptop (run detector.launch.py
+        # there).  Frees the SBC's DDS bus for SLAM's /tf so localization stops
+        # drifting under full mission load.
+        DeclareLaunchArgument('run_zone_detector', default_value='true'),
     ]
 
     nav_params = PathJoinSubstitution([
@@ -90,6 +95,7 @@ def generate_launch_description():
         # sim (0/1, 4x4_50) and on the robot (104/100, 4x4_250).
         Node(package='mirte_workshop', executable='zone_detector.py',
              name='zone_detector', output='screen',
+             condition=IfCondition(run_zone_detector),   # false → run it on the laptop
              parameters=[sim, {'aruco_dict': aruco_dict,
                                'zone_a_id': zone_a_id,
                                'zone_b_id': zone_b_id,
