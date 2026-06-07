@@ -201,53 +201,22 @@ class ShuttleManager(Node):
             return
 
         if self._state == 'SEARCH':
+            # Spin in place until BOTH markers are seen.  No Nav2 relocate during
+            # search: it (a) drove the robot to "random" spots, and (b) the relocate
+            # goal's cancel left Nav2 not ready for the first shuttle leg.  The
+            # camera sweeps the whole room as the robot turns (and rotation
+            # localizes fine), so spinning is enough to find markers placed in the
+            # arena; Nav2 stays idle until the first leg, exactly like point_shuttle.
             have = [z for z, v in (('A', self._zone_a), ('B', self._zone_b)) if v is not None]
             if self._zone_a is not None and self._zone_b is not None:
                 self._searching = False
                 self._cmd.publish(Twist())          # stop spinning
-                if self._navigating:
-                    self._cancel()                  # abort any relocate
                 self.get_logger().info('Both zones found — starting shuttle.')
                 self._state = 'SHUTTLE'
                 return
-
-            if self._relocating:
-                # Driving to a fresh vantage; bail to spinning if it stalls.
-                if (now - self._goal_sent_ns) / 1e9 > self._relocate_timeout:
-                    self.get_logger().warn('Relocate timeout — spinning here instead.')
-                    self._cancel()
-                    # Reset state HERE rather than waiting for _goal_done: if Nav2
-                    # never honours the cancel (a wedged goal), _goal_done never
-                    # fires, _relocating stays True, _searching stays False, and
-                    # _cmd_cb stops publishing — the robot freezes mid-mission.
-                    self._relocating = False
-                    self._navigating = False
-                    self._searching = True
-                    self._spin_start_ns = now
-                return
-
-            if not self._searching:                 # (re)start a spin
-                self._searching = True
-                self._spin_start_ns = now
-
-            if (now - self._spin_start_ns) / 1e9 < self._spin_time:
-                self.get_logger().info(f'Spinning to find zones (have {have})…',
-                                       throttle_duration_sec=3.0)
-                return
-
-            # Full revolution done, still missing a zone → wander to a new spot.
-            self._searching = False
-            self._cmd.publish(Twist())
-            wp = self._relocate_target()
-            if wp is None:
-                self._spin_start_ns = now           # no pose yet → just spin again
-                self._searching = True
-                return
-            self.get_logger().info(
-                f'Zones still missing (have {have}) — relocating to '
-                f'({wp[0]:.2f}, {wp[1]:.2f}) to look again.')
-            self._relocating = True
-            self._send_goal(*wp)
+            self._searching = True                  # _cmd_cb spins us in place
+            self.get_logger().info(f'Spinning to find zones (have {have})…',
+                                   throttle_duration_sec=3.0)
             return
 
         if self._state == 'SHUTTLE':
