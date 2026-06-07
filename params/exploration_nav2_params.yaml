@@ -21,7 +21,7 @@ controller_server:
     min_vel_x: 0.0
     min_speed_xy: 0.0
     min_theta_velocity: 1.0
-    controller_frequency: 5.0    # was 10.0 — this SBC can't sustain 10 Hz ("Control loop missed rate")
+    controller_frequency: 3.0    # 10→5→3: SBC misses 5 Hz too; 3 Hz gives each control cycle enough budget to hold rate
     controller_plugins: ["FollowPath"]
     FollowPath:
       plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
@@ -65,8 +65,12 @@ controller_server:
     progress_checker_plugins: ["progress_checker"]
     progress_checker:
       plugin: "nav2_controller::SimpleProgressChecker"
-      required_movement_radius: 0.1
-      movement_time_allowance: 10.0
+      # Lenient: the controller can't always hold its loop rate on this SBC (the
+      # SLAM queue-full hogs the bus), so the robot moves in fits.  Require only
+      # 5 cm of progress and allow 45 s before declaring "no progress", so a slow-
+      # but-moving robot still completes the leg instead of aborting partway.
+      required_movement_radius: 0.05
+      movement_time_allowance: 45.0
     goal_checker_plugins: ["goal_checker"]
     goal_checker:
       plugin: "nav2_controller::SimpleGoalChecker"
