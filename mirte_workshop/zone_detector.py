@@ -6,8 +6,7 @@ Zone detector — locates Zone A and Zone B using ArUco markers.
   Marker ID=1  DICT_4X4_50  →  Zone B stand centre   →  /zone_b_pose
   Any other ID              →  ignored
 
-This node detects ONLY the two zone markers (A and B).  The pickup boxes are
-unmarked — they are not this node's concern.
+This node detects ONLY the two zone markers (A and B); any other ID is ignored.
 
 Each detection:
   1. estimatePoseSingleMarkers gives tvec/rvec in camera frame using the
@@ -52,6 +51,15 @@ ZONE_MARKER_SIZE = 0.20   # physical side length in metres — ID 0, 1
 
 # EMA smoothing factor for position (lower = smoother, slower to converge)
 EMA_ALPHA = 0.20
+
+# Outlier rejection: a single detection that lands more than JUMP_THRESH_M from
+# the running estimate is ignored (small marker seen far away / while spinning
+# gives noisy poses, and SLAM drift bounces the map position).  Only after
+# JUMP_PERSIST consecutive far readings do we accept it (re-seed) — that way a
+# genuine shift (or a wrong first lock) still gets corrected, but transient
+# noise can't drag the zone position around.
+JUMP_THRESH_M = 0.6
+JUMP_PERSIST  = 5
 
 # Re-publish rate even when no new detection arrives
 PUBLISH_RATE_HZ = 5.0
@@ -146,11 +154,13 @@ class ZoneDetector(Node):
         self._tf_buf      = tf2_ros.Buffer()
         self._tf_listener = tf2_ros.TransformListener(self._tf_buf, self)
 
-        # Zone poses
+        # Zone poses (+ consecutive-outlier counters for jump rejection)
         self._zone_a_xy:   tuple | None = None
         self._zone_b_xy:   tuple | None = None
         self._zone_a_quat: tuple | None = None
         self._zone_b_quat: tuple | None = None
+        self._zone_a_far = 0
+        self._zone_b_far = 0
 
         # Publishers
         self._pub_a = self.create_publisher(PoseStamped, '/zone_a_pose', 10)
@@ -184,7 +194,7 @@ class ZoneDetector(Node):
 
         self.get_logger().info(
             f'Zone detector started — Zone A=id{self._a_id}, Zone B=id{self._b_id}; '
-            f'any other marker ID is ignored (boxes are unmarked).')
+            f'any other marker ID is ignored.')
 
     # ── Camera intrinsics ─────────────────────────────────────────────────────
 
@@ -273,17 +283,17 @@ class ZoneDetector(Node):
             qw = pose_map.pose.orientation.w
 
             if marker_id == self._a_id:
-                self._zone_a_xy   = self._ema(self._zone_a_xy, px, py)
-                self._zone_a_quat = (qx, qy, qz, qw)
-                self.get_logger().info(
-                    f'Zone A marker detected → map ({px:.2f}, {py:.2f})',
-                    throttle_duration_sec=2.0)
+                if self._accept_xy('a', px, py):     # reject outlier jumps
+                    self._zone_a_quat = (qx, qy, qz, qw)
+                    self.get_logger().info(
+                        f'Zone A → map ({self._zone_a_xy[0]:.2f}, {self._zone_a_xy[1]:.2f})',
+                        throttle_duration_sec=2.0)
             elif marker_id == self._b_id:
-                self._zone_b_xy   = self._ema(self._zone_b_xy, px, py)
-                self._zone_b_quat = (qx, qy, qz, qw)
-                self.get_logger().info(
-                    f'Zone B marker detected → map ({px:.2f}, {py:.2f})',
-                    throttle_duration_sec=2.0)
+                if self._accept_xy('b', px, py):
+                    self._zone_b_quat = (qx, qy, qz, qw)
+                    self.get_logger().info(
+                        f'Zone B → map ({self._zone_b_xy[0]:.2f}, {self._zone_b_xy[1]:.2f})',
+                        throttle_duration_sec=2.0)
 
     # ── Coordinate transform ──────────────────────────────────────────────────
 
@@ -326,13 +336,33 @@ class ZoneDetector(Node):
         p.pose.orientation.w = float(qw)
         return p
 
-    # ── EMA smoothing ─────────────────────────────────────────────────────────
+    # ── EMA smoothing + outlier rejection ──────────────────────────────────────
 
-    def _ema(self, current, cx, cy):
-        if current is None:
-            return (cx, cy)
-        ox, oy = current
-        return (ox + EMA_ALPHA * (cx - ox), oy + EMA_ALPHA * (cy - oy))
+    def _accept_xy(self, zone, px, py) -> bool:
+        """Update a zone's smoothed (x,y) with outlier rejection.  Returns True
+        if the reading was accepted (caller then updates orientation too).  A
+        reading >JUMP_THRESH_M from the running estimate is rejected as noise
+        unless JUMP_PERSIST consecutive far readings arrive (then re-seed)."""
+        cur = self._zone_a_xy if zone == 'a' else self._zone_b_xy
+        far = self._zone_a_far if zone == 'a' else self._zone_b_far
+        if cur is None:
+            new_xy, far, accepted = (px, py), 0, True          # first lock
+        elif math.hypot(px - cur[0], py - cur[1]) > JUMP_THRESH_M:
+            far += 1
+            if far >= JUMP_PERSIST:
+                new_xy, far, accepted = (px, py), 0, True       # persistent → re-seed
+            else:
+                new_xy, accepted = cur, False                   # transient → reject
+        else:
+            far = 0
+            new_xy = (cur[0] + EMA_ALPHA * (px - cur[0]),
+                      cur[1] + EMA_ALPHA * (py - cur[1]))
+            accepted = True
+        if zone == 'a':
+            self._zone_a_xy, self._zone_a_far = new_xy, far
+        else:
+            self._zone_b_xy, self._zone_b_far = new_xy, far
+        return accepted
 
     # ── Publishing ────────────────────────────────────────────────────────────
 
