@@ -27,6 +27,9 @@ from nav_msgs.msg import OccupancyGrid
 from geometry_msgs.msg import PoseStamped, Twist
 from nav2_msgs.action import NavigateToPose
 from action_msgs.msg import GoalStatus
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+from builtin_interfaces.msg import Duration as DurationMsg
+from control_msgs.action import GripperCommand
 
 OCCUPIED = 65   # occupancy-grid cost above which a cell counts as a (tall) obstacle
 
@@ -39,7 +42,13 @@ class ShuttleManager(Node):
         super().__init__('shuttle_manager')
 
         self._round_trips   = int(self.declare_parameter('round_trips', 3).value)
-        self._approach_dist = float(self.declare_parameter('approach_dist', 1.0).value)
+        # Distance from the marker to the robot CENTRE (base_link).  The front
+        # bumper is ~0.20 m ahead of base_link, so 0.25 m leaves a ~5 cm gap
+        # between the robot's front and the marker (the precision team's hand-off
+        # point).  NOTE: if the marker sits on a lidar-visible stand it's an
+        # obstacle in the costmap, and inflation_radius (0.30) may stop the
+        # planner short of 0.25 m — drop inflation if the leg won't plan that close.
+        self._approach_dist = float(self.declare_parameter('approach_dist', 0.25).value)
         self._search_w      = float(self.declare_parameter('search_angular', 0.4).value)
         self._goal_timeout  = float(self.declare_parameter('goal_timeout', 60.0).value)
         self._slam_wait     = float(self.declare_parameter('slam_wait_timeout', 60.0).value)
@@ -52,6 +61,18 @@ class ShuttleManager(Node):
         self._relocate_timeout = float(self.declare_parameter('relocate_timeout', 20.0).value)
         cmd_topic           = self.declare_parameter(
             'cmd_vel_topic', '/mirte_base_controller/cmd_vel_unstamped').value
+
+        # Arm choreography (mimics carrying a box A→B).  Angles are
+        # [shoulder_pan, shoulder_lift, elbow, wrist] in rad — params so they can
+        # be tuned in the field without a rebuild.  Defaults: "up" = arm straight
+        # up (compact footprint, empty), "box" = the /set_arm_front reach pose
+        # (curled forward as if cradling a box → slightly larger front footprint).
+        self._arm_up_angles  = [float(v) for v in self.declare_parameter(
+            'arm_up_angles',  [0.0,  1.5,  0.0, 0.0]).value]
+        self._arm_box_angles = [float(v) for v in self.declare_parameter(
+            'arm_box_angles', [0.0, -1.2, -1.5, 1.4]).value]
+        self._grip_open_pos  = float(self.declare_parameter('gripper_open_pos',  -0.6).value)
+        self._grip_close_pos = float(self.declare_parameter('gripper_close_pos',  0.5).value)
 
         self._zone_a: PoseStamped | None = None
         self._zone_b: PoseStamped | None = None
@@ -67,6 +88,13 @@ class ShuttleManager(Node):
         self.create_subscription(OccupancyGrid, '/map', self._map_cb, 10)
 
         self._nav = ActionClient(self, NavigateToPose, 'navigate_to_pose')
+
+        # Arm + gripper: the real robot's controllers consume these directly
+        # (the arm_server / gripper_server wrappers publish to the same topics).
+        self._arm_pub = self.create_publisher(
+            JointTrajectory, '/mirte_master_arm_controller/joint_trajectory', 10)
+        self._grip = ActionClient(
+            self, GripperCommand, '/mirte_master_gripper_controller/gripper_cmd')
 
         # Visit sequence: A, B, A, B, …
         self._legs = ['A', 'B'] * self._round_trips
@@ -192,6 +220,7 @@ class ShuttleManager(Node):
                 self.get_logger().info('SLAM/TF ready — searching for zone markers.')
                 self._state = 'SEARCH'
                 self._searching = True
+                self._spin_start_ns = now
             elif (now - self._start_ns) / 1e9 > self._slam_wait:
                 self.get_logger().error('No map→base_link TF — is SLAM running? Aborting.')
                 self._state = 'DONE'
@@ -201,22 +230,53 @@ class ShuttleManager(Node):
             return
 
         if self._state == 'SEARCH':
-            # Spin in place until BOTH markers are seen.  No Nav2 relocate during
-            # search: it (a) drove the robot to "random" spots, and (b) the relocate
-            # goal's cancel left Nav2 not ready for the first shuttle leg.  The
-            # camera sweeps the whole room as the robot turns (and rotation
-            # localizes fine), so spinning is enough to find markers placed in the
-            # arena; Nav2 stays idle until the first leg, exactly like point_shuttle.
+            # Spin one full revolution looking for BOTH markers; if a sweep ends
+            # without both, WANDER to a fresh, reachable vantage and sweep again
+            # (a marker the camera can't see from here won't be found by spinning
+            # in the same spot forever).  We only leave SEARCH for SHUTTLE when
+            # NOT mid-wander — cancelling a Nav2 drive right before leg 1 used to
+            # leave Nav2 not ready; letting the short wander settle avoids that.
             have = [z for z, v in (('A', self._zone_a), ('B', self._zone_b)) if v is not None]
-            if self._zone_a is not None and self._zone_b is not None:
+            if self._zone_a is not None and self._zone_b is not None and not self._relocating:
                 self._searching = False
                 self._cmd.publish(Twist())          # stop spinning
-                self.get_logger().info('Both zones found — starting shuttle.')
+                self.get_logger().info('Both zones found — arm up, starting shuttle.')
+                self._arm_up()                      # arm straight up as the first leg begins
                 self._state = 'SHUTTLE'
                 return
-            self._searching = True                  # _cmd_cb spins us in place
-            self.get_logger().info(f'Spinning to find zones (have {have})…',
-                                   throttle_duration_sec=3.0)
+
+            if self._relocating:
+                # Driving to a new vantage; _goal_done resumes the spin.  Guard a
+                # stalled drive so we don't sit frozen — give up and spin again.
+                if (now - self._goal_sent_ns) / 1e9 > self._relocate_timeout:
+                    self.get_logger().warn('Wander drive stalled — cancelling & spinning.')
+                    self._cancel()
+                    self._relocating = False
+                    self._searching = True
+                    self._spin_start_ns = now
+                return
+
+            if (now - self._spin_start_ns) / 1e9 < self._spin_time:
+                self._searching = True              # _cmd_cb spins us in place
+                self.get_logger().info(f'Spinning to find zones (have {have})…',
+                                       throttle_duration_sec=3.0)
+                return
+
+            # A full sweep finished without both markers → wander to a new vantage.
+            self._searching = False
+            self._cmd.publish(Twist())              # stop spinning before driving
+            tgt = self._relocate_target()
+            if tgt is None:                         # boxed in → just sweep again
+                self.get_logger().warn('No clear vantage to wander to — spinning again.',
+                                       throttle_duration_sec=3.0)
+                self._searching = True
+                self._spin_start_ns = now
+                return
+            self.get_logger().info(
+                f'Sweep done (have {have}) — wandering to a new vantage '
+                f'({tgt[0]:.2f}, {tgt[1]:.2f}) to look again.')
+            self._relocating = True
+            self._send_goal(*tgt)
             return
 
         if self._state == 'SHUTTLE':
@@ -337,10 +397,53 @@ class ShuttleManager(Node):
             return
 
         if status == GoalStatus.STATUS_SUCCEEDED:
-            self.get_logger().info(f'✓ Reached Zone {self._legs[self._leg]}.')
+            zone = self._legs[self._leg]
+            self.get_logger().info(f'✓ Reached Zone {zone}.')
+            # At A: curl the arm + close the gripper (mimic picking up the box),
+            # held through the A→B leg.  At B: arm straight up + open (dropped),
+            # held through the B→A leg.
+            if zone == 'A':
+                self._arm_box()
+            else:
+                self._arm_up()
             self._leg += 1
         else:
             self.get_logger().warn('Goal did not succeed — retrying same leg.')
+
+    # ── arm choreography ──────────────────────────────────────────────────────
+    def _arm_traj(self, angles):
+        """Send a 4-joint arm pose to the robot's arm controller (2 s move)."""
+        t = JointTrajectory()
+        t.joint_names = ['shoulder_pan_joint', 'shoulder_lift_joint',
+                         'elbow_joint', 'wrist_joint']
+        pt = JointTrajectoryPoint()
+        pt.positions = [float(a) for a in angles]
+        pt.time_from_start = DurationMsg(sec=2)
+        t.points.append(pt)
+        self._arm_pub.publish(t)
+
+    def _gripper(self, pos):
+        """Fire-and-forget gripper command (don't block the FSM waiting)."""
+        if self._grip.server_is_ready() or self._grip.wait_for_server(timeout_sec=0.5):
+            g = GripperCommand.Goal()
+            g.command.position = float(pos)
+            g.command.max_effort = 10.0
+            self._grip.send_goal_async(g)
+        else:
+            self.get_logger().warn('Gripper action server not available.',
+                                   throttle_duration_sec=5.0)
+
+    def _arm_up(self):
+        """Arm straight up + gripper open — empty / box released."""
+        self.get_logger().info('Arm → straight up (box released).')
+        self._arm_traj(self._arm_up_angles)
+        self._gripper(self._grip_open_pos)
+
+    def _arm_box(self):
+        """Arm curled forward + gripper closed — mimic holding the box."""
+        self.get_logger().info('Arm → box-holding pose (box picked up).')
+        self._arm_traj(self._arm_box_angles)
+        self._gripper(self._grip_close_pos)
 
     def _cancel(self):
         if self._goal_handle is not None:

@@ -99,9 +99,12 @@ local_costmap:
       width: 3
       height: 3
       resolution: 0.05
-      # Footprint covers chassis + arm at home pose (arm shoulder at y=-0.147 m,
-      # upper link adds ~0.10 m laterally → ±0.25 m in y is conservative).
-      footprint: "[[0.20, 0.25], [0.20, -0.25], [-0.15, -0.25], [-0.15, 0.25]]"
+      # Footprint covers chassis + arm.  Front extent is 0.32 m (was 0.20) so the
+      # box-holding arm pose (curled forward, used on the A→B legs) stays inside
+      # the footprint and the controller's collision check accounts for it; ±0.25 m
+      # lateral covers the arm at home.  Symmetric for both legs (over-reserving on
+      # the B→A "arm up" leg is harmless).
+      footprint: "[[0.32, 0.25], [0.32, -0.25], [-0.15, -0.25], [-0.15, 0.25]]"
       plugins: ["obstacle_layer", "inflation_layer"]
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
@@ -138,11 +141,13 @@ local_costmap:
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 3.5
-        # MUST be ≥ the footprint half-width (0.25 m) or the planner routes paths
-        # the 0.5 m robot can't fit, and with the controller check off it drives
-        # into pillars and wedges.  0.30 keeps paths footprint-clear; the ~0.82 m
-        # pillar gaps still leave a ~0.22 m centre corridor the planner can use.
-        inflation_radius: 0.30
+        # = the footprint half-width (0.25 m): the global path stays clear of the
+        # 0.50 m-wide robot, but no more than that, so it's MORE FORGIVING (was
+        # 0.30) — it'll thread tighter gaps now that the box-carry footprint is
+        # longer.  The controller's per-cycle footprint collision check (the full
+        # 0.32 m-front polygon) is the real safety net, so a closer global path is
+        # fine; the planner just needs to find a route.
+        inflation_radius: 0.25
       always_send_full_costmap: true
 
 global_costmap:
@@ -154,7 +159,7 @@ global_costmap:
       robot_base_frame: base_link
       use_sim_time: true
       transform_tolerance: 1.0   # see local_costmap note
-      footprint: "[[0.20, 0.25], [0.20, -0.25], [-0.15, -0.25], [-0.15, 0.25]]"
+      footprint: "[[0.32, 0.25], [0.32, -0.25], [-0.15, -0.25], [-0.15, 0.25]]"
       resolution: 0.05
       # Large enough for any demo arena — oversize is safe; costs ~4 MB RAM.
       width: 100
@@ -196,11 +201,13 @@ global_costmap:
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 3.5
-        # MUST be ≥ the footprint half-width (0.25 m) or the planner routes paths
-        # the 0.5 m robot can't fit, and with the controller check off it drives
-        # into pillars and wedges.  0.30 keeps paths footprint-clear; the ~0.82 m
-        # pillar gaps still leave a ~0.22 m centre corridor the planner can use.
-        inflation_radius: 0.30
+        # = the footprint half-width (0.25 m): the global path stays clear of the
+        # 0.50 m-wide robot, but no more than that, so it's MORE FORGIVING (was
+        # 0.30) — it'll thread tighter gaps now that the box-carry footprint is
+        # longer.  The controller's per-cycle footprint collision check (the full
+        # 0.32 m-front polygon) is the real safety net, so a closer global path is
+        # fine; the planner just needs to find a route.
+        inflation_radius: 0.25
       always_send_full_costmap: true
 
 behavior_server:
