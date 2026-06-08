@@ -36,6 +36,7 @@ def generate_launch_description():
     zone_b_id    = LaunchConfiguration('zone_b_id')
     zone_marker_size = LaunchConfiguration('zone_marker_size')
     round_trips  = LaunchConfiguration('round_trips')
+    approach_dist = LaunchConfiguration('approach_dist')
     cmd_vel_topic = LaunchConfiguration('cmd_vel_topic')
     image_topic   = LaunchConfiguration('image_topic')
     camera_info_topic = LaunchConfiguration('camera_info_topic')
@@ -50,6 +51,11 @@ def generate_launch_description():
         DeclareLaunchArgument('zone_b_id',    default_value='1'),             # real: 100
         DeclareLaunchArgument('zone_marker_size', default_value='0.20'),     # ← your PRINTED marker side, metres
         DeclareLaunchArgument('round_trips',  default_value='3'),
+        # Distance (m) from the marker to the robot CENTRE at the approach
+        # standoff.  Front bumper is ~0.20 m ahead of base_link, so 0.1 m puts
+        # the robot's front right up against the marker.  Override here instead of
+        # editing the source (editing source on the robot blocks `git pull`).
+        DeclareLaunchArgument('approach_dist', default_value='0.1'),
         DeclareLaunchArgument('cmd_vel_topic',
                               default_value='/mirte_base_controller/cmd_vel_unstamped'),
         DeclareLaunchArgument('image_topic',       default_value='/camera/image_raw'),
@@ -200,6 +206,7 @@ def generate_launch_description():
             Node(package='mirte_workshop', executable='shuttle_manager.py',
                  name='shuttle_manager', output='screen',
                  parameters=[sim, {'round_trips': round_trips,
+                                   'approach_dist': approach_dist,
                                    'cmd_vel_topic': cmd_vel_topic}]),
         ]),
     ])
