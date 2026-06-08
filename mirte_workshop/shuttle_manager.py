@@ -116,8 +116,9 @@ class ShuttleManager(Node):
         self.create_timer(1.0 / CMD_HZ, self._cmd_cb)
         self.create_timer(1.0 / TICK_HZ, self._tick)
         self.get_logger().info(
-            f'shuttle_manager up — {self._round_trips} round trips '
-            f'(legs={self._legs}), cmd_vel="{cmd_topic}".')
+            f'shuttle_manager up [build: wander+arm+approach_arg] — '
+            f'{self._round_trips} round trips (legs={self._legs}), '
+            f'approach_dist={self._approach_dist:.2f} m, cmd_vel="{cmd_topic}".')
 
     # ── callbacks ──────────────────────────────────────────────────────────
     def _a_cb(self, msg): self._zone_a = msg
