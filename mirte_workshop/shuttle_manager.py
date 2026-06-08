@@ -185,26 +185,54 @@ class ShuttleManager(Node):
         except Exception:
             return None
 
+    def _clear_distance(self, x, y, h, maxd):
+        """How far (m) a ray from (x,y) along heading `h` stays clear, up to
+        maxd.  Unknown/free cells count as clear; stops at the first obstacle."""
+        if self._map_data is None:
+            return maxd
+        d = 0.0
+        while d < maxd:
+            d += self._map_res
+            col = int((x + d * math.cos(h) - self._map_ox) / self._map_res)
+            row = int((y + d * math.sin(h) - self._map_oy) / self._map_res)
+            if 0 <= row < self._map_h and 0 <= col < self._map_w \
+                    and int(self._map_data[row, col]) > OCCUPIED:
+                return max(d - self._map_res, 0.0)
+        return maxd
+
     def _relocate_target(self):
-        """A new search vantage that is actually reachable: fan out across
-        headings and accept the first one whose target cell is clear AND has
-        clear line-of-sight from the robot — so we never fling a blind goal into
-        a wall.  Prefer the full `relocate_dist`, but take a shorter clear hop if
-        that's all that's open.  Returns None if boxed in (→ caller keeps
-        spinning)."""
+        """A new search vantage to wander to.  We only require the TARGET cell to
+        be open — Nav2's planner does the actual obstacle avoidance along the way,
+        so we do NOT demand a clear straight line-of-sight (that strict check made
+        the robot decide it was 'boxed in' and spin in place forever in a
+        cluttered arena).  Fan out across headings/distances; if nothing passes,
+        fall back to a short hop the MOST-OPEN way we can see.  Returns None only
+        when genuinely walled in on all sides."""
         p = self._robot_pose()
         if p is None:
             return None
         x, y, yaw = p
-        offsets = [0, 70, -70, 35, -35, 140, -140, 110, -110, 180]
+        offsets = [0, 45, -45, 90, -90, 135, -135, 180, 70, -70, 110, -110]
         start = self._relocate_k
         self._relocate_k += 1
-        for oi in range(len(offsets)):
-            h = yaw + math.radians(offsets[(start + oi) % len(offsets)])
-            for d in (self._relocate_dist, 1.0, 0.6):
-                tx, ty = x + d * math.cos(h), y + d * math.sin(h)
-                if self._has_clearance(tx, ty, 0.35) and self._has_los(x, y, tx, ty):
-                    return (tx, ty, h)
+        for clearance in (0.35, 0.28):
+            for oi in range(len(offsets)):
+                h = yaw + math.radians(offsets[(start + oi) % len(offsets)])
+                for d in (self._relocate_dist, 1.2, 0.9, 0.6):
+                    tx, ty = x + d * math.cos(h), y + d * math.sin(h)
+                    if self._has_clearance(tx, ty, clearance):
+                        return (tx, ty, h)
+        # Last resort: aim the most-open direction and take a short hop.  Better to
+        # move a little (Nav2 still avoids obstacles) than spin forever in place.
+        best_h, best_clear = None, 0.0
+        for deg in range(0, 360, 20):
+            h = yaw + math.radians(deg)
+            clear = self._clear_distance(x, y, h, 1.5)
+            if clear > best_clear:
+                best_h, best_clear = h, clear
+        if best_h is not None and best_clear >= 0.5:
+            d = min(best_clear - 0.3, 1.0)
+            return (x + d * math.cos(best_h), y + d * math.sin(best_h), best_h)
         return None
 
     # ── main FSM ───────────────────────────────────────────────────────────
