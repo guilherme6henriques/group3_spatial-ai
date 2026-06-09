@@ -94,7 +94,9 @@ class ShuttleManager(Node):
         self._dock_wait_for_box = bool(self.declare_parameter('dock_wait_for_box', False).value)
         # marker_navigator.py lives next to this file in the package (the friend
         # drops it straight into the package dir, run via python3 — not colcon).
-        _default_nav = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+        # realpath() resolves the symlink-install link back to the SOURCE dir,
+        # where his (untracked) marker_navigator.py actually is.
+        _default_nav = os.path.join(os.path.dirname(os.path.realpath(__file__)),
                                     'marker_navigator.py')
         self._marker_nav_path = str(self.declare_parameter(
             'marker_navigator_path', _default_nav).value)
