@@ -25,6 +25,7 @@ from launch_ros.substitutions import FindPackageShare
 
 def generate_launch_description():
     run_zone_detector = LaunchConfiguration('run_zone_detector')
+    publish_odom_tf   = LaunchConfiguration('publish_odom_tf')
 
     shuttle = PathJoinSubstitution([
         FindPackageShare('mirte_workshop'), 'launch', 'shuttle.launch.py'])
@@ -34,6 +35,9 @@ def generate_launch_description():
         # false = OFFLOAD detection to the laptop (run detector.launch.py there);
         #         the shuttle then uses the laptop's /zone_a_pose + /zone_b_pose.
         DeclareLaunchArgument('run_zone_detector', default_value='true'),
+        # This unit's base doesn't broadcast odom→base_link → run odom_to_tf.
+        # Set false on a robot whose base already publishes that TF.
+        DeclareLaunchArgument('publish_odom_tf', default_value='true'),
 
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource([shuttle]),
@@ -41,6 +45,7 @@ def generate_launch_description():
                 'use_sim_time':      'false',
                 'provide_sim_tf':    'false',
                 'run_zone_detector': run_zone_detector,
+                'publish_odom_tf':   publish_odom_tf,
                 'use_compressed':    'false',
                 'aruco_dict':        'DICT_4X4_250',
                 'zone_a_id':         '104',

@@ -46,6 +46,7 @@ def generate_launch_description():
     provide_sim_tf = LaunchConfiguration('provide_sim_tf')
     use_compressed = LaunchConfiguration('use_compressed')
     run_zone_detector = LaunchConfiguration('run_zone_detector')
+    publish_odom_tf = LaunchConfiguration('publish_odom_tf')
 
     args = [
         DeclareLaunchArgument('use_sim_time', default_value='true'),
@@ -84,6 +85,12 @@ def generate_launch_description():
         # there).  Frees the SBC's DDS bus for SLAM's /tf so localization stops
         # drifting under full mission load.
         DeclareLaunchArgument('run_zone_detector', default_value='true'),
+        # Some MIRTE units' base publishes the odom→base_link TF itself; others
+        # only publish the /mirte_base_controller/odom TOPIC (no TF, or broken
+        # frame ids).  Set true on a unit that lacks the TF → run odom_to_tf to
+        # broadcast odom→base_link (without it SLAM can't anchor).  Set false if
+        # the base already publishes it (else you'd get a duplicate publisher).
+        DeclareLaunchArgument('publish_odom_tf', default_value='false'),
     ]
 
     nav_params = PathJoinSubstitution([
@@ -141,6 +148,13 @@ def generate_launch_description():
              arguments=['/mirte_base_controller/odom', '/odom'],
              output='screen', parameters=[sim],
              condition=IfCondition(provide_sim_tf)),
+
+        # On a unit whose base does NOT broadcast odom→base_link (only the
+        # /mirte_base_controller/odom topic), publish that TF so SLAM can anchor.
+        # publish_odom_tf:=true enables it.
+        Node(package='mirte_workshop', executable='odom_to_tf.py',
+             name='odom_to_tf', output='screen', parameters=[sim],
+             condition=IfCondition(publish_odom_tf)),
 
         # REAL ROBOT ONLY (provide_sim_tf:=false): the robot's minimal bringup
         # publishes only odom→base_link — it does NOT run robot_state_publisher
