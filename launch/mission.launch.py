@@ -29,20 +29,25 @@ from launch_ros.substitutions import FindPackageShare
 
 
 def generate_launch_description():
-    precision_pkg   = LaunchConfiguration('precision_pkg')
-    nav_exec        = LaunchConfiguration('marker_navigator_exec')
-    placer_exec     = LaunchConfiguration('box_placer_exec')
-    run_box_placer  = LaunchConfiguration('run_box_placer')
+    precision_pkg     = LaunchConfiguration('precision_pkg')
+    nav_exec          = LaunchConfiguration('marker_navigator_exec')
+    placer_exec       = LaunchConfiguration('box_placer_exec')
+    run_box_placer    = LaunchConfiguration('run_box_placer')
+    run_zone_detector = LaunchConfiguration('run_zone_detector')
 
     shuttle = PathJoinSubstitution([
         FindPackageShare('mirte_workshop'), 'launch', 'shuttle.launch.py'])
 
     return LaunchDescription([
-        # ── precision team nodes (override if they live elsewhere) ─────────────
-        DeclareLaunchArgument('precision_pkg',         default_value='precision_team'),
+        # ── precision team nodes (their .py live in THIS package on the robot) ──
+        DeclareLaunchArgument('precision_pkg',         default_value='mirte_workshop'),
         DeclareLaunchArgument('marker_navigator_exec', default_value='marker_navigator.py'),
         DeclareLaunchArgument('box_placer_exec',       default_value='box_placer.py'),
         DeclareLaunchArgument('run_box_placer',        default_value='false'),
+        # true  = detect A/B on the robot (camera read locally).
+        # false = OFFLOAD detection to the laptop (run detector.launch.py there);
+        #         the shuttle then uses the laptop's /zone_a_pose + /zone_b_pose.
+        DeclareLaunchArgument('run_zone_detector',     default_value='true'),
 
         # 1) the whole shuttle stack, real-robot args baked in.
         IncludeLaunchDescription(
@@ -50,7 +55,7 @@ def generate_launch_description():
             launch_arguments={
                 'use_sim_time':      'false',
                 'provide_sim_tf':    'false',
-                'run_zone_detector': 'true',
+                'run_zone_detector': run_zone_detector,
                 'use_compressed':    'false',
                 'aruco_dict':        'DICT_4X4_250',
                 'zone_a_id':         '104',
