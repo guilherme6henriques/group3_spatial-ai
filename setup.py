@@ -41,8 +41,6 @@ setup(
             "point_shuttle.py = mirte_workshop.point_shuttle:main",
             "strafe_shuttle.py = mirte_workshop.strafe_shuttle:main",
             "shuttle_manager.py = mirte_workshop.shuttle_manager:main",
-            # Precision-team node (its .py lives in this package on the robot).
-            "marker_navigator.py = mirte_workshop.marker_navigator:main",
         ],
     },
 )
