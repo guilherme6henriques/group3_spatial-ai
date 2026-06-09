@@ -24,7 +24,8 @@ from launch_ros.actions import Node
 def generate_launch_description():
     aruco_dict        = LaunchConfiguration('aruco_dict')
     zone_a_id         = LaunchConfiguration('zone_a_id')
-    zone_b_id         = LaunchConfiguration('zone_b_id')
+    zone_b_left_id    = LaunchConfiguration('zone_b_left_id')
+    zone_b_right_id   = LaunchConfiguration('zone_b_right_id')
     zone_marker_size  = LaunchConfiguration('zone_marker_size')
     image_topic       = LaunchConfiguration('image_topic')
     camera_info_topic = LaunchConfiguration('camera_info_topic')
@@ -33,7 +34,9 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument('aruco_dict',        default_value='DICT_4X4_250'),
         DeclareLaunchArgument('zone_a_id',         default_value='104'),
-        DeclareLaunchArgument('zone_b_id',         default_value='100'),
+        # Zone B = midpoint of the precision stand's two markers.
+        DeclareLaunchArgument('zone_b_left_id',    default_value='101'),
+        DeclareLaunchArgument('zone_b_right_id',   default_value='102'),
         DeclareLaunchArgument('zone_marker_size',  default_value='0.08'),
         DeclareLaunchArgument('image_topic',       default_value='/camera/color/image_raw'),
         DeclareLaunchArgument('camera_info_topic', default_value='/camera/color/camera_info'),
@@ -44,7 +47,8 @@ def generate_launch_description():
              parameters=[{'use_sim_time': False,
                           'aruco_dict': aruco_dict,
                           'zone_a_id': zone_a_id,
-                          'zone_b_id': zone_b_id,
+                          'zone_b_left_id': zone_b_left_id,
+                          'zone_b_right_id': zone_b_right_id,
                           'zone_marker_size': zone_marker_size,
                           'use_compressed': use_compressed}],
              remappings=[('/camera/image_raw', image_topic),

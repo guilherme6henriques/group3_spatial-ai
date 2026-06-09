@@ -32,11 +32,14 @@ from launch_ros.substitutions import FindPackageShare
 def generate_launch_description():
     use_sim_time = LaunchConfiguration('use_sim_time')
     aruco_dict   = LaunchConfiguration('aruco_dict')
-    zone_a_id    = LaunchConfiguration('zone_a_id')
-    zone_b_id    = LaunchConfiguration('zone_b_id')
+    zone_a_id        = LaunchConfiguration('zone_a_id')
+    zone_b_left_id   = LaunchConfiguration('zone_b_left_id')
+    zone_b_right_id  = LaunchConfiguration('zone_b_right_id')
     zone_marker_size = LaunchConfiguration('zone_marker_size')
     round_trips  = LaunchConfiguration('round_trips')
     approach_dist = LaunchConfiguration('approach_dist')
+    dock_at_b    = LaunchConfiguration('dock_at_b')
+    dock_approach_dist = LaunchConfiguration('dock_approach_dist')
     cmd_vel_topic = LaunchConfiguration('cmd_vel_topic')
     image_topic   = LaunchConfiguration('image_topic')
     camera_info_topic = LaunchConfiguration('camera_info_topic')
@@ -47,10 +50,20 @@ def generate_launch_description():
     args = [
         DeclareLaunchArgument('use_sim_time', default_value='true'),
         DeclareLaunchArgument('aruco_dict',   default_value='DICT_4X4_50'),   # real: DICT_4X4_250
-        DeclareLaunchArgument('zone_a_id',    default_value='0'),             # real: 104
-        DeclareLaunchArgument('zone_b_id',    default_value='1'),             # real: 100
+        DeclareLaunchArgument('zone_a_id',       default_value='0'),          # real: 104
+        # Zone B is the precision stand's TWO markers; /zone_b_pose = midpoint.
+        DeclareLaunchArgument('zone_b_left_id',  default_value='1'),          # real: 101
+        DeclareLaunchArgument('zone_b_right_id', default_value='2'),          # real: 102
         DeclareLaunchArgument('zone_marker_size', default_value='0.20'),     # ← your PRINTED marker side, metres
         DeclareLaunchArgument('round_trips',  default_value='3'),
+        # Hand off the precise B docking to the precision team (marker_navigator +
+        # box_placer): at B the shuttle stops, publishes /start_docking, and waits
+        # for /robot_backed_up before the B→A leg.  Set false for the stand-alone
+        # single-target shuttle with the arm-carry mimic.
+        DeclareLaunchArgument('dock_at_b',          default_value='true'),
+        # Standoff (m) for the B leg when docking — stop further back so BOTH B
+        # markers stay in the camera FOV for marker_navigator's precise dock.
+        DeclareLaunchArgument('dock_approach_dist', default_value='0.5'),
         # Distance (m) from the marker to the robot CENTRE at the approach
         # standoff.  Front bumper is ~0.20 m ahead of base_link, so 0.1 m puts
         # the robot's front right up against the marker.  Override here instead of
@@ -98,13 +111,14 @@ def generate_launch_description():
              name='scan_filter', output='screen', parameters=[sim]),
 
         # Zone detector — marker IDs/dict are params so the same node works in
-        # sim (0/1, 4x4_50) and on the robot (104/100, 4x4_250).
+        # sim (A=0, B=1/2, 4x4_50) and on the robot (A=104, B=101/102, 4x4_250).
         Node(package='mirte_workshop', executable='zone_detector.py',
              name='zone_detector', output='screen',
              condition=IfCondition(run_zone_detector),   # false → run it on the laptop
              parameters=[sim, {'aruco_dict': aruco_dict,
                                'zone_a_id': zone_a_id,
-                               'zone_b_id': zone_b_id,
+                               'zone_b_left_id': zone_b_left_id,
+                               'zone_b_right_id': zone_b_right_id,
                                'zone_marker_size': zone_marker_size,
                                'use_compressed': use_compressed}],
              remappings=[('/camera/image_raw', image_topic),
@@ -207,6 +221,8 @@ def generate_launch_description():
                  name='shuttle_manager', output='screen',
                  parameters=[sim, {'round_trips': round_trips,
                                    'approach_dist': approach_dist,
+                                   'dock_at_b': dock_at_b,
+                                   'dock_approach_dist': dock_approach_dist,
                                    'cmd_vel_topic': cmd_vel_topic}]),
         ]),
     ])

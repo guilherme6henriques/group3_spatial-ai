@@ -1,21 +1,29 @@
 #!/usr/bin/env python3
 """
-Zone detector — locates Zone A and Zone B using ArUco markers.
+Zone detector — locates Zone A (one marker) and Zone B (the midpoint of TWO
+markers) using ArUco, for the A↔B shuttle.
 
-  Marker ID=0  DICT_4X4_50  →  Zone A pole entrance  →  /zone_a_pose
-  Marker ID=1  DICT_4X4_50  →  Zone B stand centre   →  /zone_b_pose
-  Any other ID              →  ignored
+  Zone A  : one marker (zone_a_id)                  →  /zone_a_pose
+  Zone B  : midpoint of two markers (zone_b_left_id, →  /zone_b_pose
+            zone_b_right_id) — the precision team's
+            placement stand
+  Any other ID                                       →  ignored
 
-This node detects ONLY the two zone markers (A and B); any other ID is ignored.
+Why B is two markers: Zone B is the precision-team's placement stand, which
+carries a marker pair (e.g. 101 left / 102 right).  We publish their MIDPOINT as
+/zone_b_pose so the shuttle navigates straight to the stand and stops there; the
+precision dock (marker_navigator) then does the cm-level alignment between the
+two markers.  (The old single Zone-B marker is gone — erase it from the arena.)
 
 Each detection:
   1. estimatePoseSingleMarkers gives tvec/rvec in camera frame using the
-     physical zone-marker size.
-  2. TF transforms the marker position and orientation to map frame.
-  3. Position is EMA-smoothed; orientation is taken from the most recent frame.
-  4. The PoseStamped orientation encodes the marker's facing direction (+Z in
-     its own frame) so navigation can compute approach waypoints.
-  5. All poses are re-published at PUBLISH_RATE_HZ even between detections.
+     physical marker size.
+  2. TF transforms the marker position into the map frame.
+  3. Each marker's map position is EMA-smoothed with outlier rejection.
+  4. Zone A pose = its marker; Zone B pose = midpoint of the two B markers
+     (orientation carried from one of them — the shuttle computes its own
+     facing yaw, so B's orientation is not critical).
+  5. Poses are re-published at PUBLISH_RATE_HZ even between detections.
 
 Requires:
   cv2.aruco (OpenCV 4.5.4 old API — Dictionary_get / DetectorParameters_create)
@@ -46,8 +54,7 @@ except ImportError:
 
 # ── ArUco config ──────────────────────────────────────────────────────────────
 MARKER_DICT      = cv2.aruco.DICT_4X4_50 if _CV else None
-ZONE_MARKER_IDS  = frozenset({0, 1})
-ZONE_MARKER_SIZE = 0.20   # physical side length in metres — ID 0, 1
+ZONE_MARKER_SIZE = 0.08   # physical side length in metres
 
 # EMA smoothing factor for position (lower = smoother, slower to converge)
 EMA_ALPHA = 0.20
@@ -55,9 +62,7 @@ EMA_ALPHA = 0.20
 # Outlier rejection: a single detection that lands more than JUMP_THRESH_M from
 # the running estimate is ignored (small marker seen far away / while spinning
 # gives noisy poses, and SLAM drift bounces the map position).  Only after
-# JUMP_PERSIST consecutive far readings do we accept it (re-seed) — that way a
-# genuine shift (or a wrong first lock) still gets corrected, but transient
-# noise can't drag the zone position around.
+# JUMP_PERSIST consecutive far readings do we accept it (re-seed).
 JUMP_THRESH_M = 0.6
 JUMP_PERSIST  = 5
 
@@ -123,18 +128,20 @@ class ZoneDetector(Node):
 
         self._bridge = CvBridge()
 
-        # Marker config as ROS params so the SAME node works in sim (ids 0/1,
-        # DICT_4X4_50) and on the real robot (e.g. ids 104/100, DICT_4X4_250).
+        # Marker config as ROS params so the SAME node works in sim and on the
+        # real robot.  Zone A is one marker; Zone B is a pair (left/right) whose
+        # midpoint is the stand centre.
         dict_name = self.declare_parameter('aruco_dict', 'DICT_4X4_50').value
-        self._a_id = int(self.declare_parameter('zone_a_id', 0).value)
-        self._b_id = int(self.declare_parameter('zone_b_id', 1).value)
+        self._a_id  = int(self.declare_parameter('zone_a_id',        0).value)
+        self._bl_id = int(self.declare_parameter('zone_b_left_id',   1).value)
+        self._br_id = int(self.declare_parameter('zone_b_right_id',  2).value)
         self._marker_size = float(
             self.declare_parameter('zone_marker_size', ZONE_MARKER_SIZE).value)
 
         a = cv2.aruco
         dict_id = getattr(a, dict_name)
         try:
-            self._aruco_dict = a.getPredefinedDictionary(dict_id)   # works on 4.5 & 4.7+
+            self._aruco_dict = a.getPredefinedDictionary(dict_id)   # 4.5 & 4.7+
         except AttributeError:
             self._aruco_dict = a.Dictionary_get(dict_id)
         if hasattr(a, 'ArucoDetector'):            # OpenCV >= 4.7 (new API)
@@ -144,7 +151,8 @@ class ZoneDetector(Node):
             self._aruco_params = a.DetectorParameters_create()
             self._new_aruco_api = False
         self.get_logger().info(
-            f'ArUco dict={dict_name}, Zone A=id{self._a_id}, Zone B=id{self._b_id}, '
+            f'ArUco dict={dict_name}, Zone A=id{self._a_id}, '
+            f'Zone B=midpoint(id{self._bl_id}, id{self._br_id}), '
             f'size={self._marker_size} m, api={"new" if self._new_aruco_api else "old"}')
 
         self._camera_matrix: np.ndarray | None = None
@@ -154,34 +162,20 @@ class ZoneDetector(Node):
         self._tf_buf      = tf2_ros.Buffer()
         self._tf_listener = tf2_ros.TransformListener(self._tf_buf, self)
 
-        # Zone poses (+ consecutive-outlier counters for jump rejection)
-        self._zone_a_xy:   tuple | None = None
-        self._zone_b_xy:   tuple | None = None
-        self._zone_a_quat: tuple | None = None
-        self._zone_b_quat: tuple | None = None
-        self._zone_a_far = 0
-        self._zone_b_far = 0
+        # Per-marker tracks: id -> {'xy': (x,y)|None, 'quat': (..)|None, 'far': int}
+        self._track = {mid: {'xy': None, 'quat': None, 'far': 0}
+                       for mid in (self._a_id, self._bl_id, self._br_id)}
 
         # Publishers
         self._pub_a = self.create_publisher(PoseStamped, '/zone_a_pose', 10)
         self._pub_b = self.create_publisher(PoseStamped, '/zone_b_pose', 10)
 
-        # Cameras publish with SensorData QoS (BEST_EFFORT); a default RELIABLE
-        # subscriber silently gets nothing from them (esp. on the real robot),
-        # so subscribe with sensor QoS to match any camera.
+        # Cameras publish with SensorData QoS (BEST_EFFORT); subscribe with sensor
+        # QoS or a default RELIABLE subscriber silently gets nothing.
         self.create_subscription(CameraInfo, '/camera/camera_info',
                                  self._camera_info_cb, qos_profile_sensor_data)
-        # Decode/detect on only every Nth frame.  The orbbec streams ~30 Hz, but
-        # ArUco decode of a 640x480 frame is costly and the SBC also runs SLAM +
-        # Nav2; processing every frame starves Nav2 (its lifecycle activation
-        # times out).  ~6 Hz is ample to catch a marker during a slow spin.
         self._frame_skip = int(self.declare_parameter('frame_skip', 5).value)
         self._frame_i = 0
-        # Subscribing to the raw 30 Hz image and deserializing every frame costs
-        # ~40% of a CPU core even when we only decode every Nth.  The compressed
-        # (JPEG) stream is ~20x smaller, so receiving it is cheap and we only
-        # cv2.imdecode the frames we actually process.  use_compressed:=true on
-        # the real robot; sim publishes raw, so it defaults false.
         self._use_compressed = bool(self.declare_parameter('use_compressed', False).value)
         if self._use_compressed:
             self.create_subscription(CompressedImage, '/camera/image_raw/compressed',
@@ -193,8 +187,8 @@ class ZoneDetector(Node):
         self.create_timer(1.0 / PUBLISH_RATE_HZ, self._publish_zones)
 
         self.get_logger().info(
-            f'Zone detector started — Zone A=id{self._a_id}, Zone B=id{self._b_id}; '
-            f'any other marker ID is ignored.')
+            f'Zone detector started — Zone A=id{self._a_id}, '
+            f'Zone B=midpoint(id{self._bl_id},id{self._br_id}); other IDs ignored.')
 
     # ── Camera intrinsics ─────────────────────────────────────────────────────
 
@@ -240,6 +234,13 @@ class ZoneDetector(Node):
             return
         self._process(cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY), msg.header.stamp)
 
+    def _label(self, mid) -> str:
+        if mid == self._a_id:
+            return 'A'
+        if mid == self._bl_id:
+            return 'B-left'
+        return 'B-right'
+
     def _process(self, gray, stamp):
         if self._new_aruco_api:
             corners, ids, _ = self._detector.detectMarkers(gray)
@@ -250,26 +251,21 @@ class ZoneDetector(Node):
         if ids is None or len(ids) == 0:
             return
 
-        # DEBUG: what IDs is the camera actually seeing?  Tells us at a glance
-        # whether a "looked at but not found" marker is simply a different ID
-        # than zone_a_id/zone_b_id (or is being misread by the wrong dictionary).
         self.get_logger().info(
             f'ArUco detected IDs={sorted(int(x) for x in ids.flatten())} '
-            f'(want A={self._a_id}, B={self._b_id})',
+            f'(want A={self._a_id}, B={self._bl_id}/{self._br_id})',
             throttle_duration_sec=1.0)
 
         for i, marker_id in enumerate(ids.flatten()):
             marker_id = int(marker_id)
-            # Only the two ZONE markers are handled here; ignore any other ID.
-            if marker_id not in (self._a_id, self._b_id):
+            if marker_id not in self._track:
                 continue
             rvec, tvec, _ = cv2.aruco.estimatePoseSingleMarkers(
                 [corners[i]], self._marker_size, self._camera_matrix, self._dist_coeffs)
-            rvec, tvec = rvec[0], tvec[0]   # unwrap batch dimension
+            rvec, tvec = rvec[0], tvec[0]
 
             pose_map = self._to_map_pose(rvec, tvec, stamp)
             if pose_map is None:
-                # Detected a zone marker but couldn't place it in map — TF gap.
                 self.get_logger().warn(
                     f'Marker {marker_id} seen but map transform failed '
                     f'(cam frame "{self._cam_frame}").', throttle_duration_sec=2.0)
@@ -277,23 +273,15 @@ class ZoneDetector(Node):
 
             px = pose_map.pose.position.x
             py = pose_map.pose.position.y
-            qx = pose_map.pose.orientation.x
-            qy = pose_map.pose.orientation.y
-            qz = pose_map.pose.orientation.z
-            qw = pose_map.pose.orientation.w
+            quat = (pose_map.pose.orientation.x, pose_map.pose.orientation.y,
+                    pose_map.pose.orientation.z, pose_map.pose.orientation.w)
 
-            if marker_id == self._a_id:
-                if self._accept_xy('a', px, py):     # reject outlier jumps
-                    self._zone_a_quat = (qx, qy, qz, qw)
-                    self.get_logger().info(
-                        f'Zone A → map ({self._zone_a_xy[0]:.2f}, {self._zone_a_xy[1]:.2f})',
-                        throttle_duration_sec=2.0)
-            elif marker_id == self._b_id:
-                if self._accept_xy('b', px, py):
-                    self._zone_b_quat = (qx, qy, qz, qw)
-                    self.get_logger().info(
-                        f'Zone B → map ({self._zone_b_xy[0]:.2f}, {self._zone_b_xy[1]:.2f})',
-                        throttle_duration_sec=2.0)
+            if self._accept_xy(marker_id, px, py):     # reject outlier jumps
+                self._track[marker_id]['quat'] = quat
+                xy = self._track[marker_id]['xy']
+                self.get_logger().info(
+                    f'{self._label(marker_id)} (id{marker_id}) → map '
+                    f'({xy[0]:.2f}, {xy[1]:.2f})', throttle_duration_sec=2.0)
 
     # ── Coordinate transform ──────────────────────────────────────────────────
 
@@ -302,8 +290,7 @@ class ZoneDetector(Node):
             return None
         try:
             tf = self._tf_buf.lookup_transform(
-                'map', self._cam_frame,
-                rclpy.time.Time(),
+                'map', self._cam_frame, rclpy.time.Time(),
                 timeout=Duration(seconds=0.05))
         except Exception:
             return None
@@ -336,56 +323,58 @@ class ZoneDetector(Node):
         p.pose.orientation.w = float(qw)
         return p
 
-    # ── EMA smoothing + outlier rejection ──────────────────────────────────────
+    # ── EMA smoothing + outlier rejection (per marker id) ───────────────────────
 
-    def _accept_xy(self, zone, px, py) -> bool:
-        """Update a zone's smoothed (x,y) with outlier rejection.  Returns True
-        if the reading was accepted (caller then updates orientation too).  A
-        reading >JUMP_THRESH_M from the running estimate is rejected as noise
-        unless JUMP_PERSIST consecutive far readings arrive (then re-seed)."""
-        cur = self._zone_a_xy if zone == 'a' else self._zone_b_xy
-        far = self._zone_a_far if zone == 'a' else self._zone_b_far
+    def _accept_xy(self, mid, px, py) -> bool:
+        """Update marker `mid`'s smoothed (x,y) with outlier rejection.  Returns
+        True if the reading was accepted.  A reading >JUMP_THRESH_M from the
+        running estimate is rejected as noise unless JUMP_PERSIST consecutive far
+        readings arrive (then re-seed)."""
+        tr  = self._track[mid]
+        cur = tr['xy']
         if cur is None:
-            new_xy, far, accepted = (px, py), 0, True          # first lock
-        elif math.hypot(px - cur[0], py - cur[1]) > JUMP_THRESH_M:
-            far += 1
-            if far >= JUMP_PERSIST:
-                new_xy, far, accepted = (px, py), 0, True       # persistent → re-seed
-            else:
-                new_xy, accepted = cur, False                   # transient → reject
-        else:
-            far = 0
-            new_xy = (cur[0] + EMA_ALPHA * (px - cur[0]),
-                      cur[1] + EMA_ALPHA * (py - cur[1]))
-            accepted = True
-        if zone == 'a':
-            self._zone_a_xy, self._zone_a_far = new_xy, far
-        else:
-            self._zone_b_xy, self._zone_b_far = new_xy, far
-        return accepted
+            tr['xy'], tr['far'] = (px, py), 0          # first lock
+            return True
+        if math.hypot(px - cur[0], py - cur[1]) > JUMP_THRESH_M:
+            tr['far'] += 1
+            if tr['far'] >= JUMP_PERSIST:
+                tr['xy'], tr['far'] = (px, py), 0      # persistent → re-seed
+                return True
+            return False                                # transient → reject
+        tr['xy'] = (cur[0] + EMA_ALPHA * (px - cur[0]),
+                    cur[1] + EMA_ALPHA * (py - cur[1]))
+        tr['far'] = 0
+        return True
 
     # ── Publishing ────────────────────────────────────────────────────────────
 
     def _publish_zones(self):
         now = self.get_clock().now().to_msg()
-        if self._zone_a_xy is not None and self._zone_a_quat is not None:
-            self._pub_a.publish(
-                self._make_pose(self._zone_a_xy, self._zone_a_quat, now))
-        if self._zone_b_xy is not None and self._zone_b_quat is not None:
-            self._pub_b.publish(
-                self._make_pose(self._zone_b_xy, self._zone_b_quat, now))
+
+        ta = self._track[self._a_id]
+        if ta['xy'] is not None and ta['quat'] is not None:
+            self._pub_a.publish(self._make_pose(ta['xy'], ta['quat'], now))
+
+        # Zone B = midpoint of the two B markers (only once BOTH are located).
+        tl = self._track[self._bl_id]
+        tr = self._track[self._br_id]
+        if tl['xy'] is not None and tr['xy'] is not None:
+            mid_xy = ((tl['xy'][0] + tr['xy'][0]) / 2.0,
+                      (tl['xy'][1] + tr['xy'][1]) / 2.0)
+            quat = tl['quat'] or tr['quat'] or (0.0, 0.0, 0.0, 1.0)
+            self._pub_b.publish(self._make_pose(mid_xy, quat, now))
 
     def _make_pose(self, xy, quat, stamp) -> PoseStamped:
         p = PoseStamped()
         p.header.frame_id    = 'map'
         p.header.stamp       = stamp
-        p.pose.position.x    = xy[0]
-        p.pose.position.y    = xy[1]
+        p.pose.position.x    = float(xy[0])
+        p.pose.position.y    = float(xy[1])
         p.pose.position.z    = 0.0
-        p.pose.orientation.x = quat[0]
-        p.pose.orientation.y = quat[1]
-        p.pose.orientation.z = quat[2]
-        p.pose.orientation.w = quat[3]
+        p.pose.orientation.x = float(quat[0])
+        p.pose.orientation.y = float(quat[1])
+        p.pose.orientation.z = float(quat[2])
+        p.pose.orientation.w = float(quat[3])
         return p
 
 

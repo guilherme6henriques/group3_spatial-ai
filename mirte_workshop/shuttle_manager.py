@@ -27,6 +27,7 @@ from nav_msgs.msg import OccupancyGrid
 from geometry_msgs.msg import PoseStamped, Twist
 from nav2_msgs.action import NavigateToPose
 from action_msgs.msg import GoalStatus
+from std_msgs.msg import Bool
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from builtin_interfaces.msg import Duration as DurationMsg
 from control_msgs.action import GripperCommand
@@ -74,6 +75,16 @@ class ShuttleManager(Node):
         self._grip_open_pos  = float(self.declare_parameter('gripper_open_pos',  -0.6).value)
         self._grip_close_pos = float(self.declare_parameter('gripper_close_pos',  0.5).value)
 
+        # Precision-team handoff at Zone B.  When True: on reaching B the shuttle
+        # STOPS, publishes /start_docking, and yields /cmd_vel to marker_navigator
+        # (precise dock between the two B markers) + box_placer, then resumes the
+        # B→A leg only after /robot_backed_up.  The shuttle does NOT touch the arm
+        # in this mode — box_placer owns the arm at B.  dock_approach_dist is the
+        # standoff for the B leg: stop ~0.5 m back (not the 0.1 m close approach)
+        # so BOTH B markers are in the camera FOV for marker_navigator to dock.
+        self._dock_at_b        = bool(self.declare_parameter('dock_at_b', True).value)
+        self._dock_approach    = float(self.declare_parameter('dock_approach_dist', 0.5).value)
+
         self._zone_a: PoseStamped | None = None
         self._zone_b: PoseStamped | None = None
 
@@ -96,6 +107,11 @@ class ShuttleManager(Node):
         self._grip = ActionClient(
             self, GripperCommand, '/mirte_master_gripper_controller/gripper_cmd')
 
+        # Precision handoff at B: tell marker_navigator to start its precise dock,
+        # and wait for box_placer's drive-back to finish before resuming.
+        self._dock_pub = self.create_publisher(Bool, '/start_docking', 10)
+        self.create_subscription(Bool, '/robot_backed_up', self._backed_up_cb, 10)
+
         # Visit sequence: A, B, A, B, …
         self._legs = ['A', 'B'] * self._round_trips
         self._leg = 0
@@ -104,6 +120,7 @@ class ShuttleManager(Node):
         self._searching = False
         self._navigating = False
         self._relocating = False        # driving to a new search vantage
+        self._docking = False           # at B, yielded to precision (marker_navigator)
         self._spin_start_ns = 0
         self._relocate_k = 0
         self._goal_handle = None
@@ -289,8 +306,10 @@ class ShuttleManager(Node):
             if self._zone_a is not None and self._zone_b is not None and not self._relocating:
                 self._searching = False
                 self._cmd.publish(Twist())          # stop spinning
-                self.get_logger().info('Both zones found — arm up, starting shuttle.')
-                self._arm_up()                      # arm straight up as the first leg begins
+                self.get_logger().info('Both zones found — starting shuttle.')
+                if not self._dock_at_b:
+                    self._arm_up()                  # arm mimic only when NOT handing
+                                                    # the arm to the precision team
                 self._state = 'SHUTTLE'
                 return
 
@@ -329,6 +348,15 @@ class ShuttleManager(Node):
             return
 
         if self._state == 'SHUTTLE':
+            if self._docking:
+                # At B — precision (marker_navigator + box_placer) owns /cmd_vel.
+                # Keep nudging the trigger (it's idempotent) until they ack via
+                # /robot_backed_up; do NOT drive or send goals meanwhile.
+                self._dock_pub.publish(Bool(data=True))
+                self.get_logger().info(
+                    'At Zone B — handed off to precision dock; waiting for '
+                    '/robot_backed_up…', throttle_duration_sec=5.0)
+                return
             if self._navigating:
                 if (now - self._goal_sent_ns) / 1e9 > self._goal_timeout:
                     self.get_logger().warn('Goal timeout — cancelling & retrying.')
@@ -339,14 +367,18 @@ class ShuttleManager(Node):
                 self.get_logger().info('Shuttle complete — all legs done.')
                 self._state = 'DONE'
                 return
-            tgt = self._zone_a if self._legs[self._leg] == 'A' else self._zone_b
-            wp = self._approach(tgt)
+            zone = self._legs[self._leg]
+            tgt = self._zone_a if zone == 'A' else self._zone_b
+            # Stop further back at B (dock_approach) so both B markers stay in the
+            # camera FOV for the precise dock; close approach (approach_dist) at A.
+            dist = self._dock_approach if (zone == 'B' and self._dock_at_b) else None
+            wp = self._approach(tgt, dist)
             if wp is None:
                 self.get_logger().warn('No clear line-of-sight standoff yet — retrying.',
                                        throttle_duration_sec=2.0)
                 return
             self.get_logger().info(
-                f'Leg {self._leg + 1}/{len(self._legs)} → Zone {self._legs[self._leg]} '
+                f'Leg {self._leg + 1}/{len(self._legs)} → Zone {zone} '
                 f'approach ({wp[0]:.2f}, {wp[1]:.2f})')
             self._send_goal(*wp)
             return
@@ -354,10 +386,10 @@ class ShuttleManager(Node):
         # DONE → idle.
 
     # ── navigation helpers ───────────────────────────────────────────────────
-    def _approach(self, target: PoseStamped):
-        """A standoff `approach_dist` from the target, facing it.  ALWAYS returns
-        a waypoint once the marker is known (only None if the robot pose is
-        unknown), so a leg always starts — Nav2's planner does the obstacle
+    def _approach(self, target: PoseStamped, dist=None):
+        """A standoff `dist` (default approach_dist) from the target, facing it.
+        ALWAYS returns a waypoint once the marker is known (only None if the robot
+        pose is unknown), so a leg always starts — Nav2's planner does the obstacle
         avoidance to it.  If the map is available we PREFER a standoff that is
         clear and has line-of-sight to the marker (so a pillar isn't between
         robot and tag), but if none is found we fall back to the plain
@@ -367,7 +399,7 @@ class ShuttleManager(Node):
             return None
         rx, ry = r[0], r[1]
         tx, ty = target.pose.position.x, target.pose.position.y
-        d = self._approach_dist
+        d = self._approach_dist if dist is None else dist
         base = math.atan2(ry - ty, rx - tx)        # target → robot (dead-front)
 
         # Always-valid default: straight-line standoff `d` from the marker toward
@@ -448,16 +480,36 @@ class ShuttleManager(Node):
         if status == GoalStatus.STATUS_SUCCEEDED:
             zone = self._legs[self._leg]
             self.get_logger().info(f'✓ Reached Zone {zone}.')
-            # At A: curl the arm + close the gripper (mimic picking up the box),
-            # held through the A→B leg.  At B: arm straight up + open (dropped),
-            # held through the B→A leg.
-            if zone == 'A':
-                self._arm_box()
-            else:
-                self._arm_up()
+            if zone == 'B' and self._dock_at_b:
+                # PRECISION HANDOFF: stop here and let marker_navigator dock
+                # precisely between the two B markers and box_placer place the
+                # box.  Do NOT advance the leg or touch the arm until the drive-
+                # back finishes (/robot_backed_up).  The SHUTTLE state keeps
+                # re-publishing /start_docking while _docking is set.
+                self.get_logger().info(
+                    'Zone B reached — handing off to precision (/start_docking).')
+                self._docking = True
+                self._dock_pub.publish(Bool(data=True))
+                return
+            # Stand-alone arm mimic (only when NOT handing the arm to precision):
+            # at A curl + close (pick up); at B arm up + open (drop).
+            if not self._dock_at_b:
+                if zone == 'A':
+                    self._arm_box()
+                else:
+                    self._arm_up()
             self._leg += 1
         else:
             self.get_logger().warn('Goal did not succeed — retrying same leg.')
+
+    def _backed_up_cb(self, msg: Bool):
+        """marker_navigator finished the dock + box_placer drive-back → resume."""
+        if self._docking and msg.data:
+            self.get_logger().info(
+                'Precision finished (/robot_backed_up) — resuming shuttle.')
+            self._docking = False
+            self._dock_pub.publish(Bool(data=False))   # release the trigger
+            self._leg += 1                              # Zone B leg complete
 
     # ── arm choreography ──────────────────────────────────────────────────────
     def _arm_traj(self, angles):
