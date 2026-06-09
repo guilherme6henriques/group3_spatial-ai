@@ -186,9 +186,23 @@ class ShuttleManager(Node):
         except Exception:
             return None
 
+    def _in_map(self, wx, wy, margin=2):
+        """True if (wx,wy) is inside the current /map grid (with a cell `margin`
+        from the edge).  Nav2's global costmap is sized to this SLAM map, so a
+        goal outside it makes the planner fail ('off the global costmap' /
+        worldToMap), which is exactly what stalled the wander — the targets fell
+        off the edge of the small mapped area."""
+        if self._map_data is None:
+            return False
+        col = int((wx - self._map_ox) / self._map_res)
+        row = int((wy - self._map_oy) / self._map_res)
+        return (margin <= col < self._map_w - margin and
+                margin <= row < self._map_h - margin)
+
     def _clear_distance(self, x, y, h, maxd):
         """How far (m) a ray from (x,y) along heading `h` stays clear, up to
-        maxd.  Unknown/free cells count as clear; stops at the first obstacle."""
+        maxd.  Unknown/free cells count as clear; stops at the first obstacle OR
+        at the map edge (beyond the map is off the costmap → unreachable)."""
         if self._map_data is None:
             return maxd
         d = 0.0
@@ -196,9 +210,10 @@ class ShuttleManager(Node):
             d += self._map_res
             col = int((x + d * math.cos(h) - self._map_ox) / self._map_res)
             row = int((y + d * math.sin(h) - self._map_oy) / self._map_res)
-            if 0 <= row < self._map_h and 0 <= col < self._map_w \
-                    and int(self._map_data[row, col]) > OCCUPIED:
-                return max(d - self._map_res, 0.0)
+            if not (0 <= row < self._map_h and 0 <= col < self._map_w):
+                return max(d - self._map_res, 0.0)      # reached the map edge
+            if int(self._map_data[row, col]) > OCCUPIED:
+                return max(d - self._map_res, 0.0)      # hit an obstacle
         return maxd
 
     def _relocate_target(self):
@@ -221,10 +236,13 @@ class ShuttleManager(Node):
                 h = yaw + math.radians(offsets[(start + oi) % len(offsets)])
                 for d in (self._relocate_dist, 1.2, 0.9, 0.6):
                     tx, ty = x + d * math.cos(h), y + d * math.sin(h)
-                    if self._has_clearance(tx, ty, clearance):
+                    # MUST stay on the costmap (the small SLAM map) AND be clear,
+                    # or the planner aborts with 'goal off the global costmap'.
+                    if self._in_map(tx, ty) and self._has_clearance(tx, ty, clearance):
                         return (tx, ty, h)
-        # Last resort: aim the most-open direction and take a short hop.  Better to
-        # move a little (Nav2 still avoids obstacles) than spin forever in place.
+        # Last resort: aim the most-open direction and take a short hop (stays on
+        # the map by construction — _clear_distance stops at the map edge).  Better
+        # to move a little (Nav2 still avoids obstacles) than spin forever.
         best_h, best_clear = None, 0.0
         for deg in range(0, 360, 20):
             h = yaw + math.radians(deg)
@@ -233,7 +251,9 @@ class ShuttleManager(Node):
                 best_h, best_clear = h, clear
         if best_h is not None and best_clear >= 0.5:
             d = min(best_clear - 0.3, 1.0)
-            return (x + d * math.cos(best_h), y + d * math.sin(best_h), best_h)
+            tx, ty = x + d * math.cos(best_h), y + d * math.sin(best_h)
+            if self._in_map(tx, ty):
+                return (tx, ty, best_h)
         return None
 
     # ── main FSM ───────────────────────────────────────────────────────────
