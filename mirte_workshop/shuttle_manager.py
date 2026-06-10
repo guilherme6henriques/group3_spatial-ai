@@ -106,6 +106,22 @@ class ShuttleManager(Node):
         self._dock_right  = int(self.declare_parameter('dock_marker_right', 102).value)
         self._dock_size   = float(self.declare_parameter('dock_marker_size', 0.08).value)
         self._dock_timeout = float(self.declare_parameter('dock_timeout', 120.0).value)
+        # Environment overrides for the SPAWNED marker_navigator — passed as ROS
+        # params/remaps so the friend's code is never edited.  Defaults = the real
+        # robot (matching his hardcoded values); the SIM launch overrides them
+        # (raw /camera/image_raw, cmd_vel_unstamped, gentler approach/seek since
+        # the sim markers are on a solid wall).  approach/seek < 0 = "don't pass,
+        # keep his defaults".
+        self._dock_image_topic = str(self.declare_parameter(
+            'dock_image_topic', '/camera/color/image_raw').value)
+        self._dock_info_topic = str(self.declare_parameter(
+            'dock_info_topic', '/camera/color/camera_info').value)
+        # marker_navigator PUBLISHES /mirte_base_controller/cmd_vel (hardcoded);
+        # if the base listens elsewhere (sim: cmd_vel_unstamped) we remap it.
+        self._dock_cmd_vel_topic = str(self.declare_parameter(
+            'dock_cmd_vel_topic', '/mirte_base_controller/cmd_vel').value)
+        self._dock_approach_m = float(self.declare_parameter('dock_approach_m', -1.0).value)
+        self._dock_seek_dist  = float(self.declare_parameter('dock_seek_dist', -1.0).value)
         self._dock_proc = None        # the spawned marker_navigator process
         self._dock_start_ns = 0
         # Full box-place cycle (dock_wait_for_box=True): also spawn the friend's
@@ -621,7 +637,8 @@ class ShuttleManager(Node):
     def _spawn_dock(self):
         """Launch marker_navigator (precise dock) and, for the full cycle, the
         box_placer (lay-down + walk-back).  Both are the friend's UNCHANGED
-        scripts, started fresh each B so they begin in their idle state."""
+        scripts, started fresh each B so they begin in their idle state.  The
+        environment (sim vs real) is adapted purely via params/remaps."""
         self._kill_dock()                     # clear any leftovers first
         self._start_placing_sent = False
         if not os.path.exists(self._marker_nav_path):
@@ -630,15 +647,27 @@ class ShuttleManager(Node):
                 'skipping dock, returning to A.')
             self._finish_dock()
             return
-        self._dock_proc = self._popen(self._marker_nav_path, [
-            '--ros-args',
-            '-p', f'marker_id_left:={self._dock_left}',
-            '-p', f'marker_id_right:={self._dock_right}',
-            '-p', f'marker_size:={self._dock_size}'])
+        use_sim = bool(self.get_parameter('use_sim_time').value)
+        nav_args = ['--ros-args',
+                    '-p', f'use_sim_time:={str(use_sim).lower()}',
+                    '-p', f'marker_id_left:={self._dock_left}',
+                    '-p', f'marker_id_right:={self._dock_right}',
+                    '-p', f'marker_size:={self._dock_size}',
+                    '-p', f'image_topic:={self._dock_image_topic}',
+                    '-p', f'info_topic:={self._dock_info_topic}']
+        if self._dock_approach_m > 0.0:
+            nav_args += ['-p', f'approach_m:={self._dock_approach_m}']
+        if self._dock_seek_dist > 0.0:
+            nav_args += ['-p', f'seek_dist_m:={self._dock_seek_dist}']
+        if self._dock_cmd_vel_topic != '/mirte_base_controller/cmd_vel':
+            # his publisher topic is hardcoded — remap it to where the base listens
+            nav_args += ['-r', f'/mirte_base_controller/cmd_vel:={self._dock_cmd_vel_topic}']
+        self._dock_proc = self._popen(self._marker_nav_path, nav_args)
         # Full cycle: also run box_placer (arm-only; safe to run alongside).
         if self._dock_wait_for_box:
             if os.path.exists(self._box_placer_path):
-                self._box_proc = self._popen(self._box_placer_path)
+                self._box_proc = self._popen(self._box_placer_path, [
+                    '--ros-args', '-p', f'use_sim_time:={str(use_sim).lower()}'])
             else:
                 self.get_logger().warn(
                     f'box_placer not found at {self._box_placer_path} — '

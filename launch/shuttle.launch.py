@@ -41,6 +41,12 @@ def generate_launch_description():
     dock_at_b    = LaunchConfiguration('dock_at_b')
     dock_approach_dist = LaunchConfiguration('dock_approach_dist')
     dock_wait_for_box = LaunchConfiguration('dock_wait_for_box')
+    dock_marker_size   = LaunchConfiguration('dock_marker_size')
+    dock_image_topic   = LaunchConfiguration('dock_image_topic')
+    dock_info_topic    = LaunchConfiguration('dock_info_topic')
+    dock_cmd_vel_topic = LaunchConfiguration('dock_cmd_vel_topic')
+    dock_approach_m    = LaunchConfiguration('dock_approach_m')
+    dock_seek_dist     = LaunchConfiguration('dock_seek_dist')
     cmd_vel_topic = LaunchConfiguration('cmd_vel_topic')
     image_topic   = LaunchConfiguration('image_topic')
     camera_info_topic = LaunchConfiguration('camera_info_topic')
@@ -52,12 +58,15 @@ def generate_launch_description():
 
     args = [
         DeclareLaunchArgument('use_sim_time', default_value='true'),
-        DeclareLaunchArgument('aruco_dict',   default_value='DICT_4X4_50'),   # real: DICT_4X4_250
-        DeclareLaunchArgument('zone_a_id',       default_value='0'),          # real: 100
-        # Zone B is the precision stand's TWO markers; /zone_b_pose = midpoint.
-        DeclareLaunchArgument('zone_b_left_id',  default_value='1'),          # real: 101
-        DeclareLaunchArgument('zone_b_right_id', default_value='2'),          # real: 102
-        DeclareLaunchArgument('zone_marker_size', default_value='0.20'),     # ← your PRINTED marker side, metres
+        # Sim arena now matches the REAL marker scheme: DICT_4X4_250, Zone A
+        # pole = id 100, Zone B = ids 101/102 glued on the east wall.  Only the
+        # marker size differs (sim panels 0.15 m vs 0.08 m printed).
+        DeclareLaunchArgument('aruco_dict',   default_value='DICT_4X4_250'),
+        DeclareLaunchArgument('zone_a_id',       default_value='100'),
+        # Zone B is the precision pair's TWO markers; /zone_b_pose = midpoint.
+        DeclareLaunchArgument('zone_b_left_id',  default_value='101'),
+        DeclareLaunchArgument('zone_b_right_id', default_value='102'),
+        DeclareLaunchArgument('zone_marker_size', default_value='0.15'),     # real: 0.08 (printed size)
         DeclareLaunchArgument('round_trips',  default_value='3'),
         # Hand off the precise B docking to the precision team (marker_navigator +
         # box_placer): at B the shuttle stops, publishes /start_docking, and waits
@@ -71,6 +80,16 @@ def generate_launch_description():
         # /robot_positioned→/start_placing; resume on /robot_backed_up — i.e. the
         # lay-down + walk-back).  false = just the precise adjust, then back to A.
         DeclareLaunchArgument('dock_wait_for_box', default_value='false'),
+        # Settings handed to the SPAWNED marker_navigator/box_placer (the friend's
+        # scripts, configured via params/remaps only).  Defaults = real robot;
+        # the sim mission overrides camera/cmd_vel/sizes.
+        DeclareLaunchArgument('dock_marker_size',   default_value='0.08'),
+        DeclareLaunchArgument('dock_image_topic',   default_value='/camera/color/image_raw'),
+        DeclareLaunchArgument('dock_info_topic',    default_value='/camera/color/camera_info'),
+        DeclareLaunchArgument('dock_cmd_vel_topic', default_value='/mirte_base_controller/cmd_vel'),
+        # < 0 → keep marker_navigator's own defaults (approach 0.40 / seek 0.22).
+        DeclareLaunchArgument('dock_approach_m',    default_value='-1.0'),
+        DeclareLaunchArgument('dock_seek_dist',     default_value='-1.0'),
         # Distance (m) from the marker to the robot CENTRE at the approach
         # standoff.  Front bumper is ~0.20 m ahead of base_link, so 0.1 m puts
         # the robot's front right up against the marker.  Override here instead of
@@ -263,6 +282,12 @@ def generate_launch_description():
                                    'dock_at_b': dock_at_b,
                                    'dock_approach_dist': dock_approach_dist,
                                    'dock_wait_for_box': dock_wait_for_box,
+                                   'dock_marker_size': dock_marker_size,
+                                   'dock_image_topic': dock_image_topic,
+                                   'dock_info_topic': dock_info_topic,
+                                   'dock_cmd_vel_topic': dock_cmd_vel_topic,
+                                   'dock_approach_m': dock_approach_m,
+                                   'dock_seek_dist': dock_seek_dist,
                                    'cmd_vel_topic': cmd_vel_topic}]),
         ]),
     ])
