@@ -49,9 +49,12 @@ def generate_launch_description():
             IncludeLaunchDescription(
                 PythonLaunchDescriptionSource([shuttle]),
                 launch_arguments={
-                    # sim base controller's odom TF has broken frame ids
-                    # ("$(var frame_prefix '')base_link") → publish a clean one.
-                    'publish_odom_tf':   'true',
+                    # The sim body is driven by the URDF's gazebo_planar_move
+                    # plugin on /cmd_vel; it also publishes /odom and the
+                    # odom→base_link TF (so NO odom_to_tf here — the ros2_control
+                    # wheel chain doesn't actuate the body in gazebo).
+                    'cmd_vel_topic':     '/cmd_vel',
+                    'publish_odom_tf':   'false',
                     # full place cycle at B (dock → lay-down → walk-back → home)
                     'dock_at_b':         'true',
                     'dock_wait_for_box': 'true',
@@ -62,7 +65,7 @@ def generate_launch_description():
                     'dock_marker_size':   '0.15',
                     'dock_image_topic':   '/camera/image_raw',
                     'dock_info_topic':    '/camera/camera_info',
-                    'dock_cmd_vel_topic': '/mirte_base_controller/cmd_vel_unstamped',
+                    'dock_cmd_vel_topic': '/cmd_vel',
                     'dock_approach_m':    '0.45',
                     'dock_seek_dist':     '0.60',
                     # Zone A pole is a physical cylinder — don't park inside it.

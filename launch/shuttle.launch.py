@@ -95,8 +95,11 @@ def generate_launch_description():
         # the robot's front right up against the marker.  Override here instead of
         # editing the source (editing source on the robot blocks `git pull`).
         DeclareLaunchArgument('approach_dist', default_value='0.3'),
-        DeclareLaunchArgument('cmd_vel_topic',
-                              default_value='/mirte_base_controller/cmd_vel_unstamped'),
+        # SIM: the robot body is moved by the URDF's gazebo_planar_move plugin,
+        # which listens on /cmd_vel (the ros2_control wheel chain accepts commands
+        # but does not actuate the body in gazebo).  REAL robot: the mission
+        # launch overrides this with /mirte_base_controller/cmd_vel.
+        DeclareLaunchArgument('cmd_vel_topic', default_value='/cmd_vel'),
         DeclareLaunchArgument('image_topic',       default_value='/camera/image_raw'),
         DeclareLaunchArgument('camera_info_topic', default_value='/camera/camera_info'),
         # SIM provides odom relay + base_footprint/base_frame static TF.  The
@@ -186,12 +189,11 @@ def generate_launch_description():
              output='screen', parameters=[sim],
              condition=IfCondition(provide_sim_tf)),
 
-        # Sim publishes odom on /mirte_base_controller/odom; the real base
-        # already publishes /odom + odom→base_link TF, so this is sim-only.
-        Node(package='topic_tools', executable='relay',
-             arguments=['/mirte_base_controller/odom', '/odom'],
-             output='screen', parameters=[sim],
-             condition=IfCondition(provide_sim_tf)),
+        # NOTE: no odom relay in sim.  The URDF's gazebo_planar_move plugin
+        # publishes /odom AND the odom→base_link TF directly; the ros2_control
+        # /mirte_base_controller/odom in sim reads all-zeros (the wheel chain
+        # doesn't actuate the body), so relaying it into /odom would inject
+        # frozen zeros next to planar_move's live odometry.
 
         # On a unit whose base does NOT broadcast odom→base_link (only the
         # /mirte_base_controller/odom topic), publish that TF so SLAM can anchor.
