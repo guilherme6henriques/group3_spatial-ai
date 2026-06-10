@@ -30,7 +30,13 @@ from nav_msgs.msg import OccupancyGrid
 from geometry_msgs.msg import PoseStamped, Twist
 from nav2_msgs.action import NavigateToPose
 from action_msgs.msg import GoalStatus
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, String
+from rclpy.parameter import Parameter
+try:
+    from rclpy.parameter_client import AsyncParameterClient
+    _HAS_PARAM_CLIENT = True
+except ImportError:           # older rclpy without the param client
+    _HAS_PARAM_CLIENT = False
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from builtin_interfaces.msg import Duration as DurationMsg
 from control_msgs.action import GripperCommand
@@ -121,6 +127,22 @@ class ShuttleManager(Node):
         self._box_proc = None         # the spawned box_placer process
         self._start_placing_sent = False
 
+        # Arm choreography around the dock (only in dock_at_b mode):
+        #  - at A: move the arm to the box-grabbing pose (default = box_placer's
+        #    carry pose; set arm_grab_angles to your real grab pose).
+        #  - after the lay-down + return (box_placer signals /box_placed): move the
+        #    arm to zero/home.  [shoulder_pan, shoulder_lift, elbow, wrist] rad.
+        self._arm_grab_angles = [float(v) for v in self.declare_parameter(
+            'arm_grab_angles', [0.0, -0.4329, -0.8916, -0.3]).value]
+        self._arm_zero_angles = [float(v) for v in self.declare_parameter(
+            'arm_zero_angles', [0.0, 0.0, 0.0, 0.0]).value]
+        # Per-leg inflation: bigger while carrying (A→B, larger footprint), smaller
+        # when empty (B→A).  Applied to BOTH costmaps via their param service.
+        self._dynamic_inflation = bool(
+            self.declare_parameter('dynamic_inflation', True).value)
+        self._inflation_carry = float(self.declare_parameter('inflation_carry', 0.35).value)
+        self._inflation_empty = float(self.declare_parameter('inflation_empty', 0.20).value)
+
         self._zone_a: PoseStamped | None = None
         self._zone_b: PoseStamped | None = None
 
@@ -149,8 +171,21 @@ class ShuttleManager(Node):
         #   /robot_backed_up  → full box cycle done (only if dock_wait_for_box)
         self.create_subscription(Bool, '/robot_positioned', self._positioned_cb, 10)
         self.create_subscription(Bool, '/robot_backed_up',  self._backed_up_cb,  10)
+        # box_placer's "fully done" signal → arm to zero + clear box_placer.
+        self.create_subscription(String, '/box_placed', self._box_placed_cb, 10)
         # Auto-trigger box_placer once the dock is reached (its manual trigger).
         self._start_placing_pub = self.create_publisher(Bool, '/start_placing', 10)
+
+        # Per-leg inflation needs to set params on the two costmap nodes.
+        self._infl_clients = []
+        if self._dynamic_inflation and _HAS_PARAM_CLIENT:
+            self._infl_clients = [
+                AsyncParameterClient(self, 'global_costmap/global_costmap'),
+                AsyncParameterClient(self, 'local_costmap/local_costmap'),
+            ]
+        elif self._dynamic_inflation:
+            self.get_logger().warn('dynamic_inflation requested but AsyncParameterClient '
+                                   'unavailable — inflation stays fixed.')
 
         # Visit sequence: A, B, A, B, …
         self._legs = ['A', 'B'] * self._round_trips
@@ -424,6 +459,10 @@ class ShuttleManager(Node):
                 self.get_logger().warn('No clear line-of-sight standoff yet — retrying.',
                                        throttle_duration_sec=2.0)
                 return
+            # Per-leg inflation: carrying to B (bigger) vs empty to A (smaller).
+            if self._dynamic_inflation:
+                self._set_inflation(self._inflation_carry if zone == 'B'
+                                    else self._inflation_empty)
             self.get_logger().info(
                 f'Leg {self._leg + 1}/{len(self._legs)} → Zone {zone} '
                 f'approach ({wp[0]:.2f}, {wp[1]:.2f})')
@@ -537,9 +576,15 @@ class ShuttleManager(Node):
                 self._dock_start_ns = self.get_clock().now().nanoseconds
                 self._spawn_dock()
                 return
-            # Stand-alone arm mimic (only when NOT docking at B):
-            # at A curl + close (pick up); at B arm up + open (drop).
-            if not self._dock_at_b:
+            if self._dock_at_b:
+                # Reached A (B is handled above): move the arm to the box-grabbing
+                # pose for the carry to B.  box_placer isn't running here (cleared
+                # after the previous B), so no arm contention.
+                if zone == 'A':
+                    self.get_logger().info('At A — arm → box-grab pose.')
+                    self._arm_traj(self._arm_grab_angles)
+            else:
+                # Stand-alone arm mimic: at A curl+close (pick up); at B up+open.
                 if zone == 'A':
                     self._arm_box()
                 else:
@@ -547,6 +592,33 @@ class ShuttleManager(Node):
             self._leg += 1
         else:
             self.get_logger().warn('Goal did not succeed — retrying same leg.')
+
+    def _box_placed_cb(self, msg: String):
+        """box_placer finished its full place + return-home → arm to zero/home,
+        and clear the box_placer process (its arm work is done)."""
+        if not self._dock_wait_for_box:
+            return
+        self.get_logger().info(
+            f'box_placer done ({msg.data}) — arm → zero, clearing box_placer.')
+        self._kill_proc(self._box_proc)
+        self._box_proc = None
+        self._arm_traj(self._arm_zero_angles)
+
+    def _set_inflation(self, radius):
+        """Set inflation_layer.inflation_radius on both costmaps (fire-and-forget)."""
+        if not self._infl_clients:
+            return
+        params = [Parameter('inflation_layer.inflation_radius',
+                            Parameter.Type.DOUBLE, float(radius))]
+        for c in self._infl_clients:
+            try:
+                if c.services_are_ready():
+                    c.set_parameters(params)
+            except Exception as e:
+                self.get_logger().warn(f'set inflation failed: {e}',
+                                       throttle_duration_sec=5.0)
+        self.get_logger().info(f'Inflation → {radius:.2f} m '
+                               f'({"carry" if radius >= self._inflation_carry else "empty"}).')
 
     # ── precise dock: spawn / kill the friend's marker_navigator + box_placer ──
     def _popen(self, path, extra_args=None):
