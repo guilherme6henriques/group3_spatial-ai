@@ -27,6 +27,7 @@ def generate_launch_description():
     run_zone_detector = LaunchConfiguration('run_zone_detector')
     publish_odom_tf   = LaunchConfiguration('publish_odom_tf')
     dock_wait_for_box = LaunchConfiguration('dock_wait_for_box')
+    use_depth_scan    = LaunchConfiguration('use_depth_scan')
 
     shuttle = PathJoinSubstitution([
         FindPackageShare('mirte_workshop'), 'launch', 'shuttle.launch.py'])
@@ -42,6 +43,8 @@ def generate_launch_description():
         # Full place cycle at B (precise dock → lay-down → walk-back → home),
         # then back to A.  Set false for just the precise adjust then back to A.
         DeclareLaunchArgument('dock_wait_for_box', default_value='true'),
+        # This unit has NO lidar → make /scan from the depth camera.
+        DeclareLaunchArgument('use_depth_scan', default_value='true'),
 
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource([shuttle]),
@@ -51,6 +54,7 @@ def generate_launch_description():
                 'run_zone_detector': run_zone_detector,
                 'publish_odom_tf':   publish_odom_tf,
                 'dock_wait_for_box': dock_wait_for_box,
+                'use_depth_scan':    use_depth_scan,
                 'use_compressed':    'false',
                 'aruco_dict':        'DICT_4X4_250',
                 'zone_a_id':         '104',

@@ -48,6 +48,7 @@ def generate_launch_description():
     use_compressed = LaunchConfiguration('use_compressed')
     run_zone_detector = LaunchConfiguration('run_zone_detector')
     publish_odom_tf = LaunchConfiguration('publish_odom_tf')
+    use_depth_scan = LaunchConfiguration('use_depth_scan')
 
     args = [
         DeclareLaunchArgument('use_sim_time', default_value='true'),
@@ -96,6 +97,11 @@ def generate_launch_description():
         # broadcast odom→base_link (without it SLAM can't anchor).  Set false if
         # the base already publishes it (else you'd get a duplicate publisher).
         DeclareLaunchArgument('publish_odom_tf', default_value='false'),
+        # On a unit with NO lidar, synthesize /scan from the depth camera
+        # (pointcloud_to_laserscan off /camera/depth/points).  Needs
+        # ros-humble-pointcloud-to-laserscan.  Forward cone only — weaker than a
+        # 360° lidar, but a real scan SLAM/costmaps can use.
+        DeclareLaunchArgument('use_depth_scan', default_value='false'),
     ]
 
     nav_params = PathJoinSubstitution([
@@ -118,6 +124,20 @@ def generate_launch_description():
     sim = {'use_sim_time': use_sim_time}
 
     return LaunchDescription(args + [
+
+        # No-lidar units: build /scan from the depth camera's point cloud.  Output
+        # in base_link as a horizontal slice; scan_filter then makes /scan_filtered.
+        Node(package='pointcloud_to_laserscan',
+             executable='pointcloud_to_laserscan_node',
+             name='pointcloud_to_laserscan', output='screen',
+             condition=IfCondition(use_depth_scan),
+             remappings=[('cloud_in', '/camera/depth/points'), ('scan', '/scan')],
+             parameters=[sim, {'target_frame': 'base_link',
+                               'transform_tolerance': 0.1,
+                               'min_height': 0.08, 'max_height': 0.50,
+                               'angle_min': -1.0, 'angle_max': 1.0,
+                               'angle_increment': 0.0087, 'scan_time': 0.1,
+                               'range_min': 0.2, 'range_max': 5.0, 'use_inf': True}]),
 
         Node(package='mirte_workshop', executable='scan_filter.py',
              name='scan_filter', output='screen', parameters=[sim]),
