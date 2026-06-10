@@ -40,6 +40,7 @@ def generate_launch_description():
     approach_dist = LaunchConfiguration('approach_dist')
     dock_at_b    = LaunchConfiguration('dock_at_b')
     dock_approach_dist = LaunchConfiguration('dock_approach_dist')
+    dock_wait_for_box = LaunchConfiguration('dock_wait_for_box')
     cmd_vel_topic = LaunchConfiguration('cmd_vel_topic')
     image_topic   = LaunchConfiguration('image_topic')
     camera_info_topic = LaunchConfiguration('camera_info_topic')
@@ -65,6 +66,10 @@ def generate_launch_description():
         # Standoff (m) for the B leg when docking — stop further back so BOTH B
         # markers stay in the camera FOV for marker_navigator's precise dock.
         DeclareLaunchArgument('dock_approach_dist', default_value='0.5'),
+        # true = run the FULL place cycle at B (spawn box_placer too; bridge
+        # /robot_positioned→/start_placing; resume on /robot_backed_up — i.e. the
+        # lay-down + walk-back).  false = just the precise adjust, then back to A.
+        DeclareLaunchArgument('dock_wait_for_box', default_value='false'),
         # Distance (m) from the marker to the robot CENTRE at the approach
         # standoff.  Front bumper is ~0.20 m ahead of base_link, so 0.1 m puts
         # the robot's front right up against the marker.  Override here instead of
@@ -237,6 +242,7 @@ def generate_launch_description():
                                    'approach_dist': approach_dist,
                                    'dock_at_b': dock_at_b,
                                    'dock_approach_dist': dock_approach_dist,
+                                   'dock_wait_for_box': dock_wait_for_box,
                                    'cmd_vel_topic': cmd_vel_topic}]),
         ]),
     ])

@@ -26,6 +26,7 @@ from launch_ros.substitutions import FindPackageShare
 def generate_launch_description():
     run_zone_detector = LaunchConfiguration('run_zone_detector')
     publish_odom_tf   = LaunchConfiguration('publish_odom_tf')
+    dock_wait_for_box = LaunchConfiguration('dock_wait_for_box')
 
     shuttle = PathJoinSubstitution([
         FindPackageShare('mirte_workshop'), 'launch', 'shuttle.launch.py'])
@@ -38,6 +39,9 @@ def generate_launch_description():
         # This unit's base doesn't broadcast odom→base_link → run odom_to_tf.
         # Set false on a robot whose base already publishes that TF.
         DeclareLaunchArgument('publish_odom_tf', default_value='true'),
+        # Full place cycle at B (precise dock → lay-down → walk-back → home),
+        # then back to A.  Set false for just the precise adjust then back to A.
+        DeclareLaunchArgument('dock_wait_for_box', default_value='true'),
 
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource([shuttle]),
@@ -46,6 +50,7 @@ def generate_launch_description():
                 'provide_sim_tf':    'false',
                 'run_zone_detector': run_zone_detector,
                 'publish_odom_tf':   publish_odom_tf,
+                'dock_wait_for_box': dock_wait_for_box,
                 'use_compressed':    'false',
                 'aruco_dict':        'DICT_4X4_250',
                 'zone_a_id':         '104',

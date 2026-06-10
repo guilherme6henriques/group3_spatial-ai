@@ -103,9 +103,23 @@ class ShuttleManager(Node):
         self._dock_left   = int(self.declare_parameter('dock_marker_left',  101).value)
         self._dock_right  = int(self.declare_parameter('dock_marker_right', 102).value)
         self._dock_size   = float(self.declare_parameter('dock_marker_size', 0.08).value)
-        self._dock_timeout = float(self.declare_parameter('dock_timeout', 90.0).value)
+        self._dock_timeout = float(self.declare_parameter('dock_timeout', 120.0).value)
         self._dock_proc = None        # the spawned marker_navigator process
         self._dock_start_ns = 0
+        # Full box-place cycle (dock_wait_for_box=True): also spawn the friend's
+        # box_placer.py (arm-only, safe to run), and bridge /robot_positioned →
+        # /start_placing so it auto-runs its lay-down + (wait) + return-home while
+        # marker_navigator drives back.  We DON'T grab a box — it's just the
+        # place/walk-back motion to test the merge.  box_placer lives next to this
+        # file too (untracked, run via python3).
+        _default_box = os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                                    'box_placer.py')
+        self._box_placer_path = str(self.declare_parameter(
+            'box_placer_path', _default_box).value)
+        self._auto_start_placing = bool(
+            self.declare_parameter('auto_start_placing', True).value)
+        self._box_proc = None         # the spawned box_placer process
+        self._start_placing_sent = False
 
         self._zone_a: PoseStamped | None = None
         self._zone_b: PoseStamped | None = None
@@ -130,10 +144,13 @@ class ShuttleManager(Node):
             self, GripperCommand, '/mirte_master_gripper_controller/gripper_cmd')
 
         # Dock-done signals from the (spawned) marker_navigator:
-        #   /robot_positioned → precise adjust done (we resume here when no box)
+        #   /robot_positioned → precise adjust done (resume here when no box;
+        #                        else bridge to /start_placing to run box_placer)
         #   /robot_backed_up  → full box cycle done (only if dock_wait_for_box)
         self.create_subscription(Bool, '/robot_positioned', self._positioned_cb, 10)
         self.create_subscription(Bool, '/robot_backed_up',  self._backed_up_cb,  10)
+        # Auto-trigger box_placer once the dock is reached (its manual trigger).
+        self._start_placing_pub = self.create_publisher(Bool, '/start_placing', 10)
 
         # Visit sequence: A, B, A, B, …
         self._legs = ['A', 'B'] * self._round_trips
@@ -531,52 +548,93 @@ class ShuttleManager(Node):
         else:
             self.get_logger().warn('Goal did not succeed — retrying same leg.')
 
-    # ── precise dock: spawn / kill the friend's marker_navigator ───────────────
+    # ── precise dock: spawn / kill the friend's marker_navigator + box_placer ──
+    def _popen(self, path, extra_args=None):
+        """Run a friend's script via python3 (it isn't a colcon executable)."""
+        cmd = ['python3', path]
+        if extra_args:
+            cmd += extra_args
+        self.get_logger().info('Spawning: ' + ' '.join(cmd))
+        return subprocess.Popen(cmd)
+
     def _spawn_dock(self):
-        """Launch marker_navigator.py as a subprocess for the precise B dock."""
+        """Launch marker_navigator (precise dock) and, for the full cycle, the
+        box_placer (lay-down + walk-back).  Both are the friend's UNCHANGED
+        scripts, started fresh each B so they begin in their idle state."""
+        self._kill_dock()                     # clear any leftovers first
+        self._start_placing_sent = False
         if not os.path.exists(self._marker_nav_path):
             self.get_logger().error(
                 f'marker_navigator not found at {self._marker_nav_path} — '
                 'skipping dock, returning to A.')
             self._finish_dock()
             return
-        cmd = ['python3', self._marker_nav_path, '--ros-args',
-               '-p', f'marker_id_left:={self._dock_left}',
-               '-p', f'marker_id_right:={self._dock_right}',
-               '-p', f'marker_size:={self._dock_size}']
-        self.get_logger().info('Spawning precise dock: ' + ' '.join(cmd))
-        self._dock_proc = subprocess.Popen(cmd)
+        self._dock_proc = self._popen(self._marker_nav_path, [
+            '--ros-args',
+            '-p', f'marker_id_left:={self._dock_left}',
+            '-p', f'marker_id_right:={self._dock_right}',
+            '-p', f'marker_size:={self._dock_size}'])
+        # Full cycle: also run box_placer (arm-only; safe to run alongside).
+        if self._dock_wait_for_box:
+            if os.path.exists(self._box_placer_path):
+                self._box_proc = self._popen(self._box_placer_path)
+            else:
+                self.get_logger().warn(
+                    f'box_placer not found at {self._box_placer_path} — '
+                    'dock will reach /robot_positioned but never place/back-up.')
+
+    def _kill_proc(self, proc):
+        if proc is not None and proc.poll() is None:
+            proc.send_signal(signal.SIGINT)
+            try:
+                proc.wait(timeout=3.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
 
     def _kill_dock(self):
-        """Stop the marker_navigator subprocess so it releases /cmd_vel."""
-        if self._dock_proc is not None and self._dock_proc.poll() is None:
-            self._dock_proc.send_signal(signal.SIGINT)
-            try:
-                self._dock_proc.wait(timeout=3.0)
-            except subprocess.TimeoutExpired:
-                self._dock_proc.kill()
+        """Stop BOTH dock procs (used to clear leftovers before a fresh dock and
+        on shutdown)."""
+        self._kill_proc(self._dock_proc)
+        self._kill_proc(self._box_proc)
         self._dock_proc = None
+        self._box_proc = None
         self._cmd.publish(Twist())     # make sure the base is stopped after handoff
 
     def _finish_dock(self):
-        """Dock done (or aborted): kill marker_navigator, advance past Zone B."""
-        self._kill_dock()
+        """Dock done (or aborted): kill marker_navigator to free the base and
+        resume to A.  box_placer (arm-only) is LEFT running so it can finish its
+        return-home; it's cleared at the next dock / on shutdown."""
+        self._kill_proc(self._dock_proc)
+        self._dock_proc = None
+        self._cmd.publish(Twist())
         self._docking = False
         self._leg += 1                 # Zone B leg complete → next leg is A
 
     def _positioned_cb(self, msg: Bool):
-        """Precise adjust reached.  No box step → resume straight back to A."""
-        if self._docking and not self._dock_wait_for_box and msg.data:
+        """Precise adjust reached."""
+        if not (self._docking and msg.data):
+            return
+        if not self._dock_wait_for_box:
+            # Adjust-only: no box step → straight back to A.
             self.get_logger().info(
                 'Precise dock reached (/robot_positioned) — box step skipped, '
                 'returning to A.')
             self._finish_dock()
+        elif self._auto_start_placing and not self._start_placing_sent:
+            # Full cycle: trigger box_placer's lay-down (its manual /start_placing).
+            self.get_logger().info(
+                'Precise dock reached — triggering box_placer (/start_placing); '
+                'will resume on /robot_backed_up.')
+            self._start_placing_pub.publish(Bool(data=True))
+            self._start_placing_sent = True
 
     def _backed_up_cb(self, msg: Bool):
-        """Full box cycle done (only used when dock_wait_for_box:=true)."""
+        """Full box cycle done (lay-down + walk-back) → resume to A.  box_placer
+        finishes its return-home (arm only) concurrently; it's killed at the next
+        dock / on shutdown, so we don't cut its arm motion short here."""
         if self._docking and self._dock_wait_for_box and msg.data:
             self.get_logger().info(
-                'Precision finished (/robot_backed_up) — resuming shuttle.')
+                'Walk-back done (/robot_backed_up) — resuming shuttle to A.')
             self._finish_dock()
 
     # ── arm choreography ──────────────────────────────────────────────────────
