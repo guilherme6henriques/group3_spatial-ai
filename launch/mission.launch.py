@@ -57,7 +57,7 @@ def generate_launch_description():
                 'use_depth_scan':    use_depth_scan,
                 'use_compressed':    'false',
                 'aruco_dict':        'DICT_4X4_250',
-                'zone_a_id':         '104',
+                'zone_a_id':         '100',
                 'zone_b_left_id':    '101',
                 'zone_b_right_id':   '102',
                 'zone_marker_size':  '0.08',

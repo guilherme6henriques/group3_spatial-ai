@@ -34,6 +34,7 @@ Requires:
 
 import math
 import numpy as np
+import yaml
 
 import rclpy
 from rclpy.node import Node
@@ -157,7 +158,17 @@ class ZoneDetector(Node):
 
         self._camera_matrix: np.ndarray | None = None
         self._dist_coeffs:   np.ndarray | None = None
-        self._cam_frame: str = ''
+        # Camera optical frame for the marker→map transform.  Taken from a param so
+        # the detector still works when the camera_info TOPIC isn't reaching us
+        # (it's what normally carries the frame); the topic updates it if it comes.
+        self._cam_frame: str = str(self.declare_parameter(
+            'camera_frame', 'camera_color_optical_frame').value)
+        # Optional: load intrinsics from a camera_info.yaml so we DON'T have to
+        # wait for the /camera_info topic (which sometimes doesn't cross wifi).
+        # If set + loadable, the topic becomes a non-blocking fallback.
+        _cal_path = str(self.declare_parameter('camera_info_path', '').value)
+        if _cal_path:
+            self._load_calibration(_cal_path)
 
         self._tf_buf      = tf2_ros.Buffer()
         self._tf_listener = tf2_ros.TransformListener(self._tf_buf, self)
@@ -191,6 +202,29 @@ class ZoneDetector(Node):
             f'Zone B=midpoint(id{self._bl_id},id{self._br_id}); other IDs ignored.')
 
     # ── Camera intrinsics ─────────────────────────────────────────────────────
+
+    def _load_calibration(self, path: str) -> bool:
+        """Load camera_matrix + distortion from a ROS camera_info YAML, so the
+        detector doesn't depend on the /camera_info topic crossing the network."""
+        try:
+            with open(path) as f:
+                data = yaml.safe_load(f)
+            self._camera_matrix = np.array(
+                data['camera_matrix']['data'], dtype=np.float64).reshape(3, 3)
+            self._dist_coeffs = np.array(
+                data['distortion_coefficients']['data'], dtype=np.float64)
+            self.get_logger().info(
+                f'Camera intrinsics loaded from FILE {path}: '
+                f'fx={self._camera_matrix[0,0]:.1f} fy={self._camera_matrix[1,1]:.1f} '
+                f'frame="{self._cam_frame}"')
+            return True
+        except FileNotFoundError:
+            self.get_logger().warn(
+                f'camera_info_path not found: {path} — waiting for /camera_info topic.')
+        except Exception as e:
+            self.get_logger().warn(
+                f'Failed to load {path}: {e} — waiting for /camera_info topic.')
+        return False
 
     def _camera_info_cb(self, msg: CameraInfo):
         if self._camera_matrix is not None:

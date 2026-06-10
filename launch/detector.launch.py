@@ -30,10 +30,12 @@ def generate_launch_description():
     image_topic       = LaunchConfiguration('image_topic')
     camera_info_topic = LaunchConfiguration('camera_info_topic')
     use_compressed    = LaunchConfiguration('use_compressed')
+    camera_info_path  = LaunchConfiguration('camera_info_path')
+    camera_frame      = LaunchConfiguration('camera_frame')
 
     return LaunchDescription([
         DeclareLaunchArgument('aruco_dict',        default_value='DICT_4X4_250'),
-        DeclareLaunchArgument('zone_a_id',         default_value='104'),
+        DeclareLaunchArgument('zone_a_id',         default_value='100'),
         # Zone B = midpoint of the precision stand's two markers.
         DeclareLaunchArgument('zone_b_left_id',    default_value='101'),
         DeclareLaunchArgument('zone_b_right_id',   default_value='102'),
@@ -41,6 +43,10 @@ def generate_launch_description():
         DeclareLaunchArgument('image_topic',       default_value='/camera/color/image_raw'),
         DeclareLaunchArgument('camera_info_topic', default_value='/camera/color/camera_info'),
         DeclareLaunchArgument('use_compressed',    default_value='true'),
+        # Load intrinsics from a file so the detector doesn't wait on the
+        # camera_info TOPIC (which may not cross wifi).  Empty = use the topic.
+        DeclareLaunchArgument('camera_info_path',  default_value=''),
+        DeclareLaunchArgument('camera_frame',      default_value='camera_color_optical_frame'),
 
         Node(package='mirte_workshop', executable='zone_detector.py',
              name='zone_detector', output='screen',
@@ -50,7 +56,9 @@ def generate_launch_description():
                           'zone_b_left_id': zone_b_left_id,
                           'zone_b_right_id': zone_b_right_id,
                           'zone_marker_size': zone_marker_size,
-                          'use_compressed': use_compressed}],
+                          'use_compressed': use_compressed,
+                          'camera_info_path': camera_info_path,
+                          'camera_frame': camera_frame}],
              remappings=[('/camera/image_raw', image_topic),
                          ('/camera/image_raw/compressed',
                           [image_topic, TextSubstitution(text='/compressed')]),

@@ -53,7 +53,7 @@ def generate_launch_description():
     args = [
         DeclareLaunchArgument('use_sim_time', default_value='true'),
         DeclareLaunchArgument('aruco_dict',   default_value='DICT_4X4_50'),   # real: DICT_4X4_250
-        DeclareLaunchArgument('zone_a_id',       default_value='0'),          # real: 104
+        DeclareLaunchArgument('zone_a_id',       default_value='0'),          # real: 100
         # Zone B is the precision stand's TWO markers; /zone_b_pose = midpoint.
         DeclareLaunchArgument('zone_b_left_id',  default_value='1'),          # real: 101
         DeclareLaunchArgument('zone_b_right_id', default_value='2'),          # real: 102
@@ -75,7 +75,7 @@ def generate_launch_description():
         # standoff.  Front bumper is ~0.20 m ahead of base_link, so 0.1 m puts
         # the robot's front right up against the marker.  Override here instead of
         # editing the source (editing source on the robot blocks `git pull`).
-        DeclareLaunchArgument('approach_dist', default_value='0.1'),
+        DeclareLaunchArgument('approach_dist', default_value='0.3'),
         DeclareLaunchArgument('cmd_vel_topic',
                               default_value='/mirte_base_controller/cmd_vel_unstamped'),
         DeclareLaunchArgument('image_topic',       default_value='/camera/image_raw'),
