@@ -43,8 +43,9 @@ def generate_launch_description():
         # Full place cycle at B (precise dock → lay-down → walk-back → home),
         # then back to A.  Set false for just the precise adjust then back to A.
         DeclareLaunchArgument('dock_wait_for_box', default_value='true'),
-        # This unit has NO lidar → make /scan from the depth camera.
-        DeclareLaunchArgument('use_depth_scan', default_value='true'),
+        # Real lidar is back → use it. Set true ONLY on a unit with no lidar
+        # (synthesizes /scan from the depth camera; would double-publish otherwise).
+        DeclareLaunchArgument('use_depth_scan', default_value='false'),
 
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource([shuttle]),
