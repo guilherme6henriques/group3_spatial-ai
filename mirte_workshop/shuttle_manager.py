@@ -32,11 +32,7 @@ from nav2_msgs.action import NavigateToPose
 from action_msgs.msg import GoalStatus
 from std_msgs.msg import Bool, String
 from rclpy.parameter import Parameter
-try:
-    from rclpy.parameter_client import AsyncParameterClient
-    _HAS_PARAM_CLIENT = True
-except ImportError:           # older rclpy without the param client
-    _HAS_PARAM_CLIENT = False
+from rcl_interfaces.srv import SetParameters
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from builtin_interfaces.msg import Duration as DurationMsg
 from control_msgs.action import GripperCommand
@@ -176,16 +172,12 @@ class ShuttleManager(Node):
         # Auto-trigger box_placer once the dock is reached (its manual trigger).
         self._start_placing_pub = self.create_publisher(Bool, '/start_placing', 10)
 
-        # Per-leg inflation needs to set params on the two costmap nodes.
+        # Per-leg inflation: raw SetParameters service clients to the two costmaps.
         self._infl_clients = []
-        if self._dynamic_inflation and _HAS_PARAM_CLIENT:
-            self._infl_clients = [
-                AsyncParameterClient(self, 'global_costmap/global_costmap'),
-                AsyncParameterClient(self, 'local_costmap/local_costmap'),
-            ]
-        elif self._dynamic_inflation:
-            self.get_logger().warn('dynamic_inflation requested but AsyncParameterClient '
-                                   'unavailable — inflation stays fixed.')
+        if self._dynamic_inflation:
+            for ns in ('global_costmap/global_costmap', 'local_costmap/local_costmap'):
+                self._infl_clients.append(
+                    self.create_client(SetParameters, f'/{ns}/set_parameters'))
 
         # Visit sequence: A, B, A, B, …
         self._legs = ['A', 'B'] * self._round_trips
@@ -608,15 +600,12 @@ class ShuttleManager(Node):
         """Set inflation_layer.inflation_radius on both costmaps (fire-and-forget)."""
         if not self._infl_clients:
             return
-        params = [Parameter('inflation_layer.inflation_radius',
-                            Parameter.Type.DOUBLE, float(radius))]
+        req = SetParameters.Request()
+        req.parameters = [Parameter('inflation_layer.inflation_radius',
+                                    Parameter.Type.DOUBLE, float(radius)).to_parameter_msg()]
         for c in self._infl_clients:
-            try:
-                if c.services_are_ready():
-                    c.set_parameters(params)
-            except Exception as e:
-                self.get_logger().warn(f'set inflation failed: {e}',
-                                       throttle_duration_sec=5.0)
+            if c.service_is_ready():
+                c.call_async(req)
         self.get_logger().info(f'Inflation → {radius:.2f} m '
                                f'({"carry" if radius >= self._inflation_carry else "empty"}).')
 
@@ -670,7 +659,10 @@ class ShuttleManager(Node):
         self._kill_proc(self._box_proc)
         self._dock_proc = None
         self._box_proc = None
-        self._cmd.publish(Twist())     # make sure the base is stopped after handoff
+        try:
+            self._cmd.publish(Twist())  # stop the base after handoff
+        except Exception:
+            pass                        # context may already be torn down (shutdown)
 
     def _finish_dock(self):
         """Dock done (or aborted): kill marker_navigator to free the base and
