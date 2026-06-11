@@ -83,7 +83,10 @@ class ShuttleManager(Node):
         self._relocate_dist = float(self.declare_parameter('relocate_dist', 1.5).value)
         # Shorter than goal_timeout: a relocate drive that stalls should give up
         # quickly and resume spinning, not sit frozen for the full minute.
-        self._relocate_timeout = float(self.declare_parameter('relocate_timeout', 20.0).value)
+        # 30 s (was 20): a loaded SBC can take ~20 s just to START the Nav2 goal;
+        # cancelling before it starts races the cancel against the late start and
+        # the spin fights the controller for cmd_vel.
+        self._relocate_timeout = float(self.declare_parameter('relocate_timeout', 30.0).value)
         cmd_topic           = self.declare_parameter(
             'cmd_vel_topic', '/mirte_base_controller/cmd_vel_unstamped').value
 
