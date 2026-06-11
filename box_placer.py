@@ -116,8 +116,9 @@ ARM_JOINTS = [
 # ─────────────────────────────────────────────────────────────────────────────
 WRIST_CARRY = -0.3   # rad — wrist at carry height AND at place height (no sweep during lowering)
 WRIST_PLACE = -0.3   # rad — same as carry: arm lowers with wrist held level
-WRIST_BACK  = -0.6   # rad — wrist swept to during drive-back, reached at gripper release
-T_WRIST_BACK = 10.0  # s  — tune to match typical drive-back duration
+WRIST_BACK      = -0.6   # rad — wrist swept to during drive-back, reached at gripper release
+ELBOW_BACK_DELTA =  0.15  # rad — elbow raised by this amount during drive-back (more turning clearance)
+T_WRIST_BACK     = 10.0  # s  — tune to match typical drive-back duration
 
 # Carry = arm raised, holding box forward.  Wrist already embedded.
 POSE_CARRY = [0.0, -0.4329, -0.8916, WRIST_CARRY]
@@ -294,6 +295,7 @@ class BoxPlacer(Node):
             f'>>> /robot_backed_up — repositioning wrist '
             f'{WRIST_PLACE} → {WRIST_BACK} rad, then opening gripper <<<')
         wrist_target    = list(self._place_pose())
+        wrist_target[2] += ELBOW_BACK_DELTA  # lift elbow for box turning clearance
         wrist_target[3] = WRIST_BACK
         self._arm_go(wrist_target, T_WRIST_BACK,
                      done=lambda: self._set(S.OPEN_GRIP))
