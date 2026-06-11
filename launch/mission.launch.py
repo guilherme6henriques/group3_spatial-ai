@@ -2,19 +2,22 @@
 mission.launch.py — ONE launch for the full mission on the REAL robot.
 
 Brings up the shuttle stack (SLAM + Nav2 + shuttle_manager) with all the
-real-robot args baked in (DICT_4X4_250, A=104, B=101/102, 8 cm markers,
-dock_at_b, the real cmd_vel).  The precise B dock is handled by shuttle_manager
-itself: when it reaches Zone B it LAUNCHES the precision team's
-marker_navigator.py as a subprocess, waits for the dock-done signal
-(/robot_positioned), kills it, and drives back to A.  Nothing in the friend's
-marker_navigator is changed, and the box/gripper step is skipped for now
-(dock_wait_for_box defaults False in shuttle_manager).
+real-robot args baked in (DICT_4X4_250, A=100, B=101/102, 8 cm printed markers,
+dock_at_b, the real cmd_vel, compressed camera).  At Zone B shuttle_manager
+SPAWNS the precision team's marker_navigator.py (precise dock between 101/102)
+and box_placer.py (lay-down → walk-back → return-home; no box is actually
+grabbed), then resumes to A on /robot_backed_up.  Their scripts are unchanged —
+configured purely via params/remaps.
 
     # detection ON THE ROBOT (default):
     ros2 launch mirte_workshop mission.launch.py
 
     # detection OFFLOADED TO THE LAPTOP (run detector.launch.py there):
     ros2 launch mirte_workshop mission.launch.py run_zone_detector:=false
+
+    # if the base ALREADY broadcasts odom→base_link (check with
+    # `ros2 run tf2_ros tf2_echo odom base_link` BEFORE launching):
+    ros2 launch mirte_workshop mission.launch.py publish_odom_tf:=false
 """
 from launch import LaunchDescription
 from launch.actions import IncludeLaunchDescription, DeclareLaunchArgument
@@ -56,7 +59,10 @@ def generate_launch_description():
                 'publish_odom_tf':   publish_odom_tf,
                 'dock_wait_for_box': dock_wait_for_box,
                 'use_depth_scan':    use_depth_scan,
-                'use_compressed':    'false',
+                # The real camera's raw color stream is lazy/unreliable; the
+                # compressed (JPEG) stream is always there and ~20x lighter on
+                # the SBC — robot-side zone_detector must use it.
+                'use_compressed':    'true',
                 'aruco_dict':        'DICT_4X4_250',
                 'zone_a_id':         '100',
                 'zone_b_left_id':    '101',
