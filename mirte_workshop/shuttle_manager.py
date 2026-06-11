@@ -44,6 +44,14 @@ OCCUPIED = 65   # occupancy-grid cost above which a cell counts as a (tall) obst
 TICK_HZ        = 2.0
 CMD_HZ         = 10.0
 
+# Camera fine-alignment at A (same flavour of P-servo marker_navigator uses).
+ALIGN_KP_LIN  = 0.4
+ALIGN_KP_ANG  = 0.6
+ALIGN_MAX_LIN = 0.15   # m/s
+ALIGN_MAX_ANG = 0.3    # rad/s
+ALIGN_POS_TOL = 0.05   # m   — "exactly in front" tolerance at the 1 m standoff
+ALIGN_YAW_TOL = 0.10   # rad (~6°) — facing the tag
+
 
 class ShuttleManager(Node):
     def __init__(self):
@@ -57,6 +65,15 @@ class ShuttleManager(Node):
         # obstacle in the costmap, and inflation_radius (0.30) may stop the
         # planner short of 0.25 m — drop inflation if the leg won't plan that close.
         self._approach_dist = float(self.declare_parameter('approach_dist', 0.25).value)
+        # Zone A uses its own (larger) standoff: Nav2 brings the robot to
+        # ~approach_dist_a from tag A, then the camera-based ALIGN stage (below)
+        # fine-positions it exactly in front of the tag at that same distance.
+        self._approach_dist_a = float(self.declare_parameter('approach_dist_a', 1.0).value)
+        # Camera fine-alignment at A (analogous to B's precise dock, but single
+        # tag): P-servo to the point approach_dist_a along the tag's facing
+        # normal, then rotate to face the tag.  Uses the live /zone_a_pose.
+        self._align_at_a    = bool(self.declare_parameter('align_at_a', True).value)
+        self._align_timeout = float(self.declare_parameter('align_timeout', 30.0).value)
         self._search_w      = float(self.declare_parameter('search_angular', 0.4).value)
         self._goal_timeout  = float(self.declare_parameter('goal_timeout', 60.0).value)
         self._slam_wait     = float(self.declare_parameter('slam_wait_timeout', 60.0).value)
@@ -160,6 +177,9 @@ class ShuttleManager(Node):
         self._grasping = False        # at A, yielded to mirte_perception's grasp
         self._grasp_called = False    # /grasp_handle already fired this visit
         self._grasp_start_ns = 0
+        self._aligning_a = False      # at A, camera fine-alignment in progress
+        self._align_start_ns = 0
+        self._align_pos_ok = False    # position reached → pure rotate phase
 
         # Arm choreography around the dock (only in dock_at_b mode):
         #  - at A: move the arm to the box-grabbing pose (default = box_placer's
@@ -306,6 +326,8 @@ class ShuttleManager(Node):
             tw = Twist()
             tw.angular.z = self._search_w
             self._cmd.publish(tw)
+        elif self._aligning_a:
+            self._align_a_step()        # 10 Hz camera fine-alignment servo at A
 
     def _robot_xy(self):
         p = self._robot_pose()
@@ -483,6 +505,17 @@ class ShuttleManager(Node):
                     self.get_logger().info('Docking — marker_navigator adjusting…',
                                            throttle_duration_sec=5.0)
                 return
+            if self._aligning_a:
+                # Camera fine-alignment servo runs at 10 Hz in _cmd_cb; here we
+                # only watch its timeout (servo completion calls _finish_align).
+                if (now - self._align_start_ns) / 1e9 > self._align_timeout:
+                    self.get_logger().warn(
+                        'A-alignment timeout — proceeding from current pose.')
+                    self._finish_align()
+                else:
+                    self.get_logger().info('Aligning in front of tag A…',
+                                           throttle_duration_sec=5.0)
+                return
             if self._grasping:
                 # The laptop's mirte_perception owns the base + arm during the
                 # handle grasp.  We wait for the /grasp_handle response (handled
@@ -515,9 +548,13 @@ class ShuttleManager(Node):
                 return
             zone = self._legs[self._leg]
             tgt = self._zone_a if zone == 'A' else self._zone_b
-            # Stop further back at B (dock_approach) so both B markers stay in the
-            # camera FOV for the precise dock; close approach (approach_dist) at A.
-            dist = self._dock_approach if (zone == 'B' and self._dock_at_b) else None
+            # Standoffs: B keeps dock_approach (both B markers in the camera FOV
+            # for the precise dock); A uses its own ~1 m standoff — the camera
+            # ALIGN stage then centres the robot exactly in front of the tag.
+            if zone == 'A':
+                dist = self._approach_dist_a
+            else:
+                dist = self._dock_approach if self._dock_at_b else None
             wp = self._approach(tgt, dist)
             if wp is None:
                 self.get_logger().warn('No clear line-of-sight standoff yet — retrying.',
@@ -640,35 +677,50 @@ class ShuttleManager(Node):
                 self._dock_start_ns = self.get_clock().now().nanoseconds
                 self._spawn_dock()
                 return
-            if zone == 'A' and self._grasp_at_a:
-                # HANDLE GRASP: the laptop's mirte_perception stack does the
-                # work — we wait for its first handle detection, fire
-                # /grasp_handle, and proceed on its response (success or not).
-                # grasp_node owns the arm AND base meanwhile, so no canned arm
-                # pose here and no leg advance until _finish_grasp().
-                self.get_logger().info(
-                    'Zone A reached — waiting for a handle detection from the '
-                    'laptop perception stack (/perception/object_markers).')
-                self._grasping = True
-                self._grasp_called = False
-                self._grasp_start_ns = self.get_clock().now().nanoseconds
-                return
-            if self._dock_at_b:
-                # Reached A (B is handled above): move the arm to the box-grabbing
-                # pose for the carry to B.  box_placer isn't running here (cleared
-                # after the previous B), so no arm contention.
-                if zone == 'A':
-                    self.get_logger().info('At A — arm → box-grab pose.')
-                    self._arm_traj(self._arm_grab_angles)
-            else:
-                # Stand-alone arm mimic: at A curl+close (pick up); at B up+open.
-                if zone == 'A':
-                    self._arm_box()
+            if zone == 'A':
+                if self._align_at_a:
+                    # CAMERA FINE-ALIGNMENT: Nav2 only got us ~approach_dist_a
+                    # from tag A; servo to exactly in front of it (on the tag's
+                    # facing normal, same distance), then _finish_align chains
+                    # into the grasp / arm stage.
+                    self.get_logger().info(
+                        'Zone A reached — aligning exactly in front of the tag '
+                        f'({self._approach_dist_a:.2f} m standoff).')
+                    self._aligning_a = True
+                    self._align_pos_ok = False
+                    self._align_start_ns = self.get_clock().now().nanoseconds
                 else:
-                    self._arm_up()
+                    self._after_a_arrival()
+                return
+            # Reached B without docking: stand-alone arm mimic (up + open).
+            if not self._dock_at_b:
+                self._arm_up()
             self._leg += 1
         else:
             self.get_logger().warn('Goal did not succeed — retrying same leg.')
+
+    def _after_a_arrival(self):
+        """Aligned (or align disabled) at A → grasp stage / arm pose, then the
+        leg advances (grasp advances it itself when it finishes)."""
+        if self._grasp_at_a:
+            # HANDLE GRASP: the laptop's mirte_perception stack does the work —
+            # we wait for its first handle detection, fire /grasp_handle, and
+            # proceed on its response (success or not).  grasp_node owns the arm
+            # AND base meanwhile; no leg advance until _finish_grasp().
+            self.get_logger().info(
+                'At A — waiting for a handle detection from the laptop '
+                'perception stack (/perception/object_markers).')
+            self._grasping = True
+            self._grasp_called = False
+            self._grasp_start_ns = self.get_clock().now().nanoseconds
+            return
+        if self._dock_at_b:
+            # No grasp: canned box-grab pose for the carry to B.
+            self.get_logger().info('At A — arm → box-grab pose.')
+            self._arm_traj(self._arm_grab_angles)
+        else:
+            self._arm_box()     # stand-alone arm mimic
+        self._leg += 1
 
     def _box_placed_cb(self, msg: String):
         """box_placer finished its full place + return-home → arm to zero/home,
@@ -814,6 +866,71 @@ class ShuttleManager(Node):
                 'Precision dock failed (/navigation_failed) — skipping, '
                 'proceeding with the mission.')
             self._finish_dock()
+
+    # ── camera fine-alignment at A (single tag, like B's dock) ─────────────────
+    def _align_a_step(self):
+        """10 Hz P-servo (from _cmd_cb): move to the point approach_dist_a along
+        tag A's facing normal and end up looking straight at the tag.  Uses the
+        live /zone_a_pose (position EMA'd by the detector; orientation gives the
+        tag normal).  Mecanum: translate and rotate simultaneously."""
+        r = self._robot_pose()
+        if r is None or self._zone_a is None:
+            self._cmd.publish(Twist())     # wait (tick's timeout covers a stall)
+            return
+        rx, ry, ryaw = r
+        mx = self._zone_a.pose.position.x
+        my = self._zone_a.pose.position.y
+        q = self._zone_a.pose.orientation
+        # Tag +Z axis (its facing normal) in map, projected to the ground plane.
+        nx = 2.0 * (q.x * q.z + q.y * q.w)
+        ny = 2.0 * (q.y * q.z - q.x * q.w)
+        n = math.hypot(nx, ny)
+        if n < 0.2:
+            # Degenerate orientation estimate (single-tag pose ambiguity) —
+            # fall back to the robot→tag line, like the plain standoff.
+            nx, ny = rx - mx, ry - my
+            n = math.hypot(nx, ny) or 1.0
+        nx, ny = nx / n, ny / n
+        if nx * (rx - mx) + ny * (ry - my) < 0.0:
+            nx, ny = -nx, -ny              # normal must point toward our side
+        tx = mx + self._approach_dist_a * nx
+        ty = my + self._approach_dist_a * ny
+        face_yaw = math.atan2(my - ty, mx - tx)      # look at the tag
+
+        ex, ey = tx - rx, ty - ry
+        pos_err = math.hypot(ex, ey)
+        yaw_err = math.atan2(math.sin(face_yaw - ryaw), math.cos(face_yaw - ryaw))
+
+        if self._align_pos_ok or pos_err <= ALIGN_POS_TOL:
+            self._align_pos_ok = True
+            if abs(yaw_err) <= ALIGN_YAW_TOL:
+                self.get_logger().info(
+                    f'Aligned in front of tag A (pos err {pos_err*100:.0f} cm, '
+                    f'yaw err {math.degrees(yaw_err):.0f}°).')
+                self._finish_align()
+                return
+            tw = Twist()                   # rotate-only finish
+            tw.angular.z = max(-ALIGN_MAX_ANG,
+                               min(ALIGN_MAX_ANG, ALIGN_KP_ANG * yaw_err))
+            self._cmd.publish(tw)
+            return
+
+        c, s = math.cos(ryaw), math.sin(ryaw)
+        tw = Twist()
+        tw.linear.x = max(-ALIGN_MAX_LIN,
+                          min(ALIGN_MAX_LIN, ALIGN_KP_LIN * (c * ex + s * ey)))
+        tw.linear.y = max(-ALIGN_MAX_LIN,
+                          min(ALIGN_MAX_LIN, ALIGN_KP_LIN * (-s * ex + c * ey)))
+        tw.angular.z = max(-ALIGN_MAX_ANG,
+                           min(ALIGN_MAX_ANG, ALIGN_KP_ANG * yaw_err))
+        self._cmd.publish(tw)
+
+    def _finish_align(self):
+        """Alignment done (or timed out): stop and run the at-A stage."""
+        self._aligning_a = False
+        self._align_pos_ok = False
+        self._cmd.publish(Twist())
+        self._after_a_arrival()
 
     # ── handle grasp at A (mirte_perception runs on the LAPTOP) ────────────────
     def _finish_grasp(self):

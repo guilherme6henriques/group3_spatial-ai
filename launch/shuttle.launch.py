@@ -38,6 +38,8 @@ def generate_launch_description():
     zone_marker_size = LaunchConfiguration('zone_marker_size')
     round_trips  = LaunchConfiguration('round_trips')
     approach_dist = LaunchConfiguration('approach_dist')
+    approach_dist_a = LaunchConfiguration('approach_dist_a')
+    align_at_a      = LaunchConfiguration('align_at_a')
     dock_at_b    = LaunchConfiguration('dock_at_b')
     dock_approach_dist = LaunchConfiguration('dock_approach_dist')
     dock_wait_for_box = LaunchConfiguration('dock_wait_for_box')
@@ -106,6 +108,12 @@ def generate_launch_description():
         # the robot's front right up against the marker.  Override here instead of
         # editing the source (editing source on the robot blocks `git pull`).
         DeclareLaunchArgument('approach_dist', default_value='0.3'),
+        # Zone A: Nav2 stops ~this far from tag A, then (align_at_a) a camera
+        # P-servo centres the robot EXACTLY in front of the tag at this same
+        # distance, facing it — like B's precise dock, but single-tag and the
+        # robot keeps its standoff.
+        DeclareLaunchArgument('approach_dist_a', default_value='1.0'),
+        DeclareLaunchArgument('align_at_a',      default_value='true'),
         # SIM: the robot body is moved by the URDF's gazebo_planar_move plugin,
         # which listens on /cmd_vel (the ros2_control wheel chain accepts commands
         # but does not actuate the body in gazebo).  REAL robot: the mission
@@ -292,6 +300,8 @@ def generate_launch_description():
                  name='shuttle_manager', output='screen',
                  parameters=[sim, {'round_trips': round_trips,
                                    'approach_dist': approach_dist,
+                                   'approach_dist_a': approach_dist_a,
+                                   'align_at_a': align_at_a,
                                    'dock_at_b': dock_at_b,
                                    'dock_approach_dist': dock_approach_dist,
                                    'dock_wait_for_box': dock_wait_for_box,
