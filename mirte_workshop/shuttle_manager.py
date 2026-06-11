@@ -107,7 +107,9 @@ class ShuttleManager(Node):
         self._dock_left   = int(self.declare_parameter('dock_marker_left',  101).value)
         self._dock_right  = int(self.declare_parameter('dock_marker_right', 102).value)
         self._dock_size   = float(self.declare_parameter('dock_marker_size', 0.08).value)
-        self._dock_timeout = float(self.declare_parameter('dock_timeout', 120.0).value)
+        # Covers the FULL new cycle: servo dock + lay-down + walk-back + 180°
+        # turn-around (box_placer's own wait-for-back failsafe alone is 120 s).
+        self._dock_timeout = float(self.declare_parameter('dock_timeout', 240.0).value)
         # Environment overrides for the SPAWNED marker_navigator — passed as ROS
         # params/remaps so the friend's code is never edited.  Defaults = the real
         # robot (matching his hardcoded values); the SIM launch overrides them
@@ -208,6 +210,12 @@ class ShuttleManager(Node):
         self.create_subscription(Bool, '/robot_backed_up',  self._backed_up_cb,  10)
         # box_placer's "fully done" signal → arm to zero + clear box_placer.
         self.create_subscription(String, '/box_placed', self._box_placed_cb, 10)
+        # NEW marker_navigator contract: after /box_placed it turns the robot
+        # 180° and publishes /robot_turned_around — THAT is the full-cycle end
+        # (resuming on /robot_backed_up would kill it mid turn-around).  On its
+        # timeout failsafe it publishes /navigation_failed → skip & proceed.
+        self.create_subscription(Bool, '/robot_turned_around', self._turned_cb, 10)
+        self.create_subscription(Bool, '/navigation_failed', self._nav_failed_cb, 10)
         # Auto-trigger box_placer once the dock is reached (its manual trigger).
         self._start_placing_pub = self.create_publisher(Bool, '/start_placing', 10)
 
@@ -790,12 +798,28 @@ class ShuttleManager(Node):
             self._start_placing_sent = True
 
     def _backed_up_cb(self, msg: Bool):
-        """Full box cycle done (lay-down + walk-back) → resume to A.  box_placer
-        finishes its return-home (arm only) concurrently; it's killed at the next
-        dock / on shutdown, so we don't cut its arm motion short here."""
+        """Walk-back done — but in the NEW marker_navigator flow this fires
+        mid-sequence (box_placer still opens/returns home, then the 180°
+        turn-around follows).  Just log; /robot_turned_around ends the cycle."""
         if self._docking and self._dock_wait_for_box and msg.data:
             self.get_logger().info(
-                'Walk-back done (/robot_backed_up) — resuming shuttle to A.')
+                'Walk-back done (/robot_backed_up) — waiting for the 180° '
+                'turn-around (/robot_turned_around).')
+
+    def _turned_cb(self, msg: Bool):
+        """Full cycle done: dock → place → walk-back → 180° turn.  The robot is
+        already facing away from B — resume the shuttle to A."""
+        if self._docking and self._dock_wait_for_box and msg.data:
+            self.get_logger().info(
+                'Turn-around done (/robot_turned_around) — resuming shuttle to A.')
+            self._finish_dock()
+
+    def _nav_failed_cb(self, msg: Bool):
+        """marker_navigator's timeout failsafe — skip the dock and proceed."""
+        if self._docking and msg.data:
+            self.get_logger().warn(
+                'Precision dock failed (/navigation_failed) — skipping, '
+                'proceeding with the mission.')
             self._finish_dock()
 
     # ── handle grasp at A: spawn / kill mirte_perception ───────────────────────

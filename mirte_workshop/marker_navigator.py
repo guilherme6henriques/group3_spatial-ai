@@ -7,26 +7,36 @@ WHAT IT DOES
 1. Loads camera intrinsics from camera_info.yaml (falls back to /camera_info topic).
 2. Continuously detects ArUco markers ID 101 and ID 102; prints distance on each hit.
 3. Navigates the robot to approach_m in front of the marker midpoint.
-4. Publishes /robot_positioned True (latched) → user sends /start_placing manually.
+4. Publishes /robot_positioned True (latched) → box_placer auto-starts
+   (or send /start_placing manually if auto_start is disabled there).
 5. When /arm_placed True arrives (box_placer finished lowering arm):
    drives robot BACK using ArUco feedback until seek_dist_m from marker midpoint.
 6. Publishes /robot_backed_up True → box_placer opens gripper and returns home.
+7. When /box_placed arrives (box_placer fully done): turns the robot 180° and
+   publishes /robot_turned_around True → the next script can take over.
 
 SIGNAL FLOW
 ───────────
-  marker_navigator ──/robot_positioned──► (user sends /start_placing manually)
-  box_placer       ──/arm_placed──────► marker_navigator  (auto, on PLACE_DOWN done)
-  marker_navigator ──/robot_backed_up──► box_placer       (auto, on drive-back done)
+  marker_navigator ──/robot_positioned────► box_placer  (auto-start placing)
+  box_placer       ──/arm_placed──────────► marker_navigator  (auto, on PLACE_DOWN done)
+  marker_navigator ──/robot_backed_up─────► box_placer  (auto, on drive-back done)
+  box_placer       ──/box_placed──────────► marker_navigator  (auto, sequence done)
+  marker_navigator ──/robot_turned_around─► (next script)
+  marker_navigator ──/navigation_failed───► (supervisor failsafe on timeout)
 
 STATE MACHINE
 ─────────────
-  SEARCHING  → rotate slowly until both markers found
-  DRIVE      → P-controller to target XY
-  STOP       → settle 1 s
-  ROTATE     → pure in-place yaw
-  DONE       → /robot_positioned published, waiting for /arm_placed
-  DRIVE_BACK → reverse until seek_dist_m from marker midpoint
-  BACKED_UP  → /robot_backed_up published
+  SEARCHING   → sweep yaw ±30° around the start heading until both markers found
+  DRIVE       → P-controller to target XY (re-searches if markers go stale)
+  STOP        → settle 1 s
+  ROTATE      → pure in-place yaw
+  DONE        → /robot_positioned published, waiting for /arm_placed
+  DRIVE_BACK  → reverse until seek_dist_m from marker midpoint
+  BACKED_UP   → /robot_backed_up published, waiting for /box_placed
+  TURN_AROUND → rotate 180° so the robot faces away before handing off
+  FINISHED    → /robot_turned_around published; cmd_vel released for next script
+  FAILED      → timeout failsafe: robot stopped, /navigation_failed published;
+                auto-resumes if both markers come back into view
 
 PARAMETERS  (override with --ros-args -p name:=value)
 ──────────────────────────────────────────────────────
@@ -36,9 +46,13 @@ PARAMETERS  (override with --ros-args -p name:=value)
   aruco_dict        str   DICT_4X4_250
   marker_size       float 0.08   Physical side length of markers (m)
   marker_z          float 0.05   Known height of marker centre above floor (m)
-  approach_m        float 0.40   Stop distance in front of midpoint (m), from base_link.
+  approach_m        float 0.30   Stop distance in front of midpoint (m), from base_link.
                                  Camera is ~0.15 m ahead: camera-to-wall ≈ approach_m - 0.15.
-  seek_dist_m       float 0.22   Drive-back target distance from midpoint (m), from base_link.
+                                 Note: when only one marker is visible in the final approach the
+                                 computed midpoint drifts ~10 cm further back; 0.30 compensates.
+  seek_dist_m       float 0.50   Drive-back target distance from midpoint (m), from base_link.
+                                 MUST be > approach_m (0.30). Robot backs away until this far.
+                                 e.g. approach_m=0.30 + 0.20 backup = 0.50
   image_topic       str   /camera/color/image_raw
   info_topic        str   /camera/color/camera_info
   map_frame         str   odom   (no /map frame on real robot — use odom)
@@ -66,7 +80,7 @@ import tf2_ros
 
 from geometry_msgs.msg import PoseStamped, Twist
 from sensor_msgs.msg import CameraInfo, Image
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, String
 
 try:
     from cv_bridge import CvBridge
@@ -87,9 +101,21 @@ KP_ANG = 0.60
 MAX_LIN = 0.18   # m/s
 MAX_ANG = 0.30   # rad/s
 
-SCAN_TIMEOUT_S = 60.0
 EMA_ALPHA      = 0.25
 PUBLISH_HZ     = 5.0
+
+# Search sweep: ±30° around the heading the robot had when searching started
+SCAN_SWEEP_RAD = math.radians(30.0)
+SCAN_MIN_VEL   = 0.12   # rad/s — mecanum stalls below this while sweeping
+
+# Robustness timeouts / failsafes
+SEARCH_TIMEOUT_S     = 120.0  # give up searching → FAILED
+DRIVE_TIMEOUT_S      = 120.0  # give up approaching → FAILED
+MARKER_STALE_S       = 10.0   # markers unseen this long while driving → re-search
+ROTATE_TIMEOUT_S     = 30.0   # yaw correction → accept current yaw and continue
+DRIVE_BACK_TIMEOUT_S = 60.0   # drive-back hard limit → finish anyway
+TURN_TIMEOUT_S       = 45.0   # 180° turn hard limit → finish anyway
+ARM_WAIT_WARN_S      = 120.0  # warn if box_placer never sends /arm_placed
 
 # Drive-back P-controller
 SEEK_KP        = 0.80
@@ -156,8 +182,11 @@ class S:
     STOP       = 'STOP'
     ROTATE     = 'ROTATE'
     DONE       = 'DONE'
-    DRIVE_BACK = 'DRIVE_BACK'
-    BACKED_UP  = 'BACKED_UP'
+    DRIVE_BACK  = 'DRIVE_BACK'
+    BACKED_UP   = 'BACKED_UP'
+    TURN_AROUND = 'TURN_AROUND'
+    FINISHED    = 'FINISHED'
+    FAILED      = 'FAILED'
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -181,8 +210,8 @@ class MarkerNavigator(Node):
         self._id_right   = int(self.declare_parameter('marker_id_right',  102).value)
         self._msize      = float(self.declare_parameter('marker_size',    0.08).value)
         self._marker_z   = float(self.declare_parameter('marker_z',       0.05).value)
-        self._approach_m      = float(self.declare_parameter('approach_m',      0.40).value)
-        self._seek_dist       = float(self.declare_parameter('seek_dist_m',     0.22).value)
+        self._approach_m      = float(self.declare_parameter('approach_m',      0.30).value)
+        self._seek_dist       = float(self.declare_parameter('seek_dist_m',     0.50).value)
         self._skip_approach   = bool( self.declare_parameter('skip_approach',   False).value)
         self._fallback_back_m = float(self.declare_parameter('fallback_back_m', 0.25).value)
         self._map_frame  = self.declare_parameter('map_frame',  'odom').value   # real robot has no /map
@@ -242,6 +271,17 @@ class MarkerNavigator(Node):
         self._drive_back_start = 0.0
         self._fresh_both       = False   # True only when both markers seen in same frame
         self._fb_start_pos     = None    # odom (x,y) where odom-fallback drive-back began
+        self._last_both_t      = time.monotonic()  # last time both markers seen together
+        self._drive_start_t    = 0.0
+        self._rotate_start_t   = 0.0
+        self._done_t           = 0.0
+        self._turn_start_t     = 0.0
+        self._turn_target: Optional[float] = None
+        # ±30° sweep bookkeeping
+        self._sweep_center: Optional[float] = None
+        self._sweep_dir    = -1
+        self._sweep_until  = 0.0
+        self._sweep_timed_started = False
 
         # ── Publishers ────────────────────────────────────────────────────────
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
@@ -249,6 +289,8 @@ class MarkerNavigator(Node):
         self._pub_right  = self.create_publisher(PoseStamped, '/aruco_102_pose', 10)
         self._pub_done   = self.create_publisher(Bool, '/robot_positioned', latched)
         self._pub_backed = self.create_publisher(Bool, '/robot_backed_up',  latched)
+        self._pub_turned = self.create_publisher(Bool, '/robot_turned_around', latched)
+        self._pub_failed = self.create_publisher(Bool, '/navigation_failed',   latched)
         self._pub_vel    = self.create_publisher(Twist, '/mirte_base_controller/cmd_vel', 10)
 
         # ── Subscriptions ─────────────────────────────────────────────────────
@@ -258,14 +300,24 @@ class MarkerNavigator(Node):
                                  self._on_image, qos_profile_sensor_data)
         self.create_subscription(Bool, '/arm_placed',
                                  self._on_arm_placed, 10)
+        self.create_subscription(String, '/box_placed',
+                                 self._on_box_placed, 10)
 
         # ── Timers ────────────────────────────────────────────────────────────
         self.create_timer(0.05,             self._nav_tick)
         self.create_timer(1.0 / PUBLISH_HZ, self._publish_poses)
 
+        # ── Sanity check: seek_dist must be larger than approach_m ───────────────
+        if self._seek_dist <= self._approach_m:
+            self.get_logger().error(
+                f'seek_dist_m ({self._seek_dist:.2f}) must be > approach_m '
+                f'({self._approach_m:.2f}) — robot would drive FORWARD during back-up!'
+                f'  Set seek_dist_m to at least {self._approach_m + 0.10:.2f}')
+
         # ── skip_approach: jump straight to DONE, publish /robot_positioned ──────
         if self._skip_approach:
-            self._state = S.DONE
+            self._state  = S.DONE
+            self._done_t = time.monotonic()
             self._pub_done.publish(Bool(data=True))
 
         self.get_logger().info(
@@ -429,7 +481,8 @@ class MarkerNavigator(Node):
 
         # Signal that this frame had both markers → safe to recompute target
         if frame_has_left and frame_has_right:
-            self._fresh_both = True
+            self._fresh_both  = True
+            self._last_both_t = time.monotonic()
 
     # ─────────────────────────────────────────────────────────────────────────
     # Signal from box_placer
@@ -580,13 +633,16 @@ class MarkerNavigator(Node):
 
     def _nav_tick(self):
         s = self._state
-        if   s == S.SEARCHING:  self._do_searching()
-        elif s == S.DRIVE:      self._do_drive()
-        elif s == S.STOP:       self._do_stop()
-        elif s == S.ROTATE:     self._do_rotate()
-        elif s == S.DONE:       self._pub_vel.publish(Twist())
-        elif s == S.DRIVE_BACK: self._do_drive_back()
-        elif s == S.BACKED_UP:  self._pub_vel.publish(Twist())
+        if   s == S.SEARCHING:   self._do_searching()
+        elif s == S.DRIVE:       self._do_drive()
+        elif s == S.STOP:        self._do_stop()
+        elif s == S.ROTATE:      self._do_rotate()
+        elif s == S.DONE:        self._do_done_wait()
+        elif s == S.DRIVE_BACK:  self._do_drive_back()
+        elif s == S.BACKED_UP:   self._pub_vel.publish(Twist())
+        elif s == S.TURN_AROUND: self._do_turn_around()
+        elif s == S.FAILED:      self._do_failed()
+        # FINISHED: publish nothing — leave cmd_vel free for the next script
 
     def _do_searching(self):
         elapsed = time.monotonic() - self._search_t
@@ -596,28 +652,56 @@ class MarkerNavigator(Node):
         if self._pos_right is not None: found.append(str(self._id_right))
         found_str = f'found {found},' if found else 'none found yet,'
         self.get_logger().info(
-            f'Scanning...  {found_str}  {elapsed:.0f} s  '
+            f'Scanning ±{math.degrees(SCAN_SWEEP_RAD):.0f}°...  {found_str}  '
+            f'{elapsed:.0f}/{SEARCH_TIMEOUT_S:.0f} s  '
             f'(want {self._id_left} & {self._id_right})',
             throttle_duration_sec=2.0)
-
-        if elapsed > SCAN_TIMEOUT_S:
-            self.get_logger().warn('Scan timeout — still searching.',
-                                   throttle_duration_sec=10.0)
-            self._search_t = time.monotonic()
 
         if self._both_found:
             self._pub_vel.publish(Twist())
             self._fresh_both = True
             self._compute_target()
             self._fresh_both = False
-            self._state = S.DRIVE
+            self._enter_drive()
             self.get_logger().info(
                 f'Both markers found — driving to '
                 f'({self._target_x:.3f}, {self._target_y:.3f})')
             return
 
-        t = Twist()
-        t.angular.z = self._scan_vel
+        if elapsed > SEARCH_TIMEOUT_S:
+            self._fail(
+                f'Markers not found within {SEARCH_TIMEOUT_S:.0f} s '
+                f'(±{math.degrees(SCAN_SWEEP_RAD):.0f}° sweep).')
+            return
+
+        # ── Sweep ±30° around the heading we had when searching started ──────
+        t    = Twist()
+        pose = self._get_robot_pose()
+        if pose is not None:
+            _, _, yaw = pose
+            if self._sweep_center is None:
+                self._sweep_center = yaw
+                self._sweep_dir    = 1          # sweep left first
+            target = _wrap(self._sweep_center + self._sweep_dir * SCAN_SWEEP_RAD)
+            err    = _wrap(target - yaw)
+            if abs(err) <= YAW_TOL:
+                self._sweep_dir = -self._sweep_dir   # end reached — sweep back
+                err = _wrap(self._sweep_center
+                            + self._sweep_dir * SCAN_SWEEP_RAD - yaw)
+            vel = _clamp(KP_ANG * err, self._scan_vel)
+            if abs(vel) < SCAN_MIN_VEL:
+                vel = math.copysign(SCAN_MIN_VEL, vel)
+            t.angular.z = vel
+        else:
+            # No odom — timed sweep fallback (half leg first, then full legs)
+            now = time.monotonic()
+            if now >= self._sweep_until:
+                leg = SCAN_SWEEP_RAD / max(self._scan_vel, 0.05)
+                self._sweep_until = now + (leg if not self._sweep_timed_started
+                                           else 2.0 * leg)
+                self._sweep_timed_started = True
+                self._sweep_dir = -self._sweep_dir
+            t.angular.z = self._sweep_dir * self._scan_vel
         self._pub_vel.publish(t)
 
     def _do_drive(self):
@@ -644,6 +728,22 @@ class MarkerNavigator(Node):
             f'robot=({rx:.3f},{ry:.3f})  target=({self._target_x:.3f},{self._target_y:.3f})',
             throttle_duration_sec=1.0)
 
+        # Failsafe: markers stale while still far from target → re-search
+        if dist > 0.10 and time.monotonic() - self._last_both_t > MARKER_STALE_S:
+            self.get_logger().warn(
+                f'Markers unseen for {MARKER_STALE_S:.0f} s while driving — '
+                f'stopping and re-searching.')
+            self._pub_vel.publish(Twist())
+            self._pos_left = self._pos_right = None
+            self._reset_search()
+            self._state = S.SEARCHING
+            return
+
+        # Failsafe: approach taking far too long
+        if time.monotonic() - self._drive_start_t > DRIVE_TIMEOUT_S:
+            self._fail(f'Target not reached within {DRIVE_TIMEOUT_S:.0f} s of driving.')
+            return
+
         if dist <= POS_TOL:
             self._pub_vel.publish(Twist())
             self._stop_t = time.monotonic()
@@ -662,6 +762,7 @@ class MarkerNavigator(Node):
         self._pub_vel.publish(Twist())
         if time.monotonic() - self._stop_t >= SETTLE_S:
             self.get_logger().info('Settled. Correcting yaw...')
+            self._rotate_start_t = time.monotonic()
             self._state = S.ROTATE
 
     def _do_rotate(self):
@@ -679,34 +780,60 @@ class MarkerNavigator(Node):
             f'target={math.degrees(self._target_yaw):.1f}°',
             throttle_duration_sec=1.0)
 
+        if time.monotonic() - self._rotate_start_t > ROTATE_TIMEOUT_S:
+            self.get_logger().warn(
+                f'Yaw correction timeout ({ROTATE_TIMEOUT_S:.0f} s) — accepting '
+                f'{math.degrees(err):.1f}° error and continuing.')
+            self._finish_positioning(err)
+            return
+
         if abs(err) <= YAW_TOL:
-            self._pub_vel.publish(Twist())
-            self._state = S.DONE
-            self._pub_done.publish(Bool(data=True))
-            dist = self._marker_midpoint_distance()
-            bl   = f'{dist*100:.1f} cm'       if dist is not None else 'unknown'
-            cam  = f'{(dist-0.15)*100:.1f} cm' if dist is not None else 'unknown'
-            self.get_logger().info(
-                f'\n{"="*55}\n'
-                f'  Robot positioned!\n'
-                f'  base_link → midpoint : {bl}\n'
-                f'  camera    → midpoint : {cam}  (camera ~15 cm ahead)\n'
-                f'  Yaw error : {math.degrees(err):.1f}°\n'
-                f'\n'
-                f'  ► Trigger box_placer:\n'
-                f"    ros2 topic pub --once /start_placing "
-                f"std_msgs/msg/Bool '{{data: true}}'\n"
-                f'{"="*55}'
-            )
+            self._finish_positioning(err)
             return
 
         t = Twist()
         t.angular.z = _clamp(KP_ANG * err, MAX_ANG)
         self._pub_vel.publish(t)
 
+    def _finish_positioning(self, err: float):
+        self._pub_vel.publish(Twist())
+        self._state  = S.DONE
+        self._done_t = time.monotonic()
+        self._pub_done.publish(Bool(data=True))
+        dist = self._marker_midpoint_distance()
+        bl   = f'{dist*100:.1f} cm'        if dist is not None else 'unknown'
+        cam  = f'{(dist-0.15)*100:.1f} cm' if dist is not None else 'unknown'
+        self.get_logger().info(
+            f'\n{"="*55}\n'
+            f'  Robot positioned!\n'
+            f'  base_link → midpoint : {bl}\n'
+            f'  camera    → midpoint : {cam}  (camera ~15 cm ahead)\n'
+            f'  Yaw error : {math.degrees(err):.1f}°\n'
+            f'\n'
+            f'  box_placer auto-starts on /robot_positioned (or trigger manually:\n'
+            f"  ros2 topic pub --once /start_placing std_msgs/msg/Bool '{{data: true}}')\n"
+            f'{"="*55}'
+        )
+
+    def _do_done_wait(self):
+        self._pub_vel.publish(Twist())
+        if time.monotonic() - self._done_t > ARM_WAIT_WARN_S:
+            self.get_logger().warn(
+                f'Positioned for {time.monotonic() - self._done_t:.0f} s without '
+                f'/arm_placed — is box_placer running?',
+                throttle_duration_sec=30.0)
+
     def _do_drive_back(self):
         dist    = self._marker_midpoint_distance()
         elapsed = time.monotonic() - self._drive_back_start
+
+        # Failsafe: never reverse longer than the hard limit
+        if elapsed > DRIVE_BACK_TIMEOUT_S:
+            self.get_logger().warn(
+                f'Drive-back hard timeout ({DRIVE_BACK_TIMEOUT_S:.0f} s) — finishing.')
+            self._pub_vel.publish(Twist())
+            self._finish_drive_back()
+            return
 
         if dist is None:
             # ── Odom-fallback: drive back a hardcoded distance ────────────────
@@ -778,8 +905,124 @@ class MarkerNavigator(Node):
         self._state = S.BACKED_UP
         self.get_logger().info(
             '\n>>> /robot_backed_up published <<<\n'
-            '    box_placer will open gripper and return home.'
+            '    box_placer will open gripper and return home;\n'
+            '    waiting for /box_placed to turn around.'
         )
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Turn-around after box placed
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _on_box_placed(self, msg: String):
+        if self._state != S.BACKED_UP:
+            self.get_logger().warn(
+                f'/box_placed in state {self._state} — ignoring.')
+            return
+        pose = self._get_robot_pose()
+        self._turn_start_t = time.monotonic()
+        if pose is not None:
+            _, _, yaw = pose
+            self._turn_target = _wrap(yaw + math.pi)
+        else:
+            self._turn_target = None   # no odom → timed 180° fallback
+        self._state = S.TURN_AROUND
+        self.get_logger().info(
+            f'\n>>> /box_placed ({msg.data}) — turning 180° before hand-off <<<')
+
+    def _do_turn_around(self):
+        elapsed = time.monotonic() - self._turn_start_t
+
+        if elapsed > TURN_TIMEOUT_S:
+            self.get_logger().warn(
+                f'Turn-around timeout ({TURN_TIMEOUT_S:.0f} s) — finishing anyway.')
+            self._finish_turn()
+            return
+
+        if self._turn_target is None:
+            # Timed fallback: rotate at MAX_ANG for 180° worth of time
+            if elapsed >= math.pi / MAX_ANG:
+                self._finish_turn()
+                return
+            t = Twist()
+            t.angular.z = MAX_ANG
+            self._pub_vel.publish(t)
+            return
+
+        pose = self._get_robot_pose()
+        if pose is None:
+            self._pub_vel.publish(Twist())
+            return
+
+        _, _, ryaw = pose
+        err = _wrap(self._turn_target - ryaw)
+        self.get_logger().info(
+            f'Turning around: err={math.degrees(err):.1f}°',
+            throttle_duration_sec=1.0)
+
+        if abs(err) <= YAW_TOL:
+            self._finish_turn()
+            return
+
+        vel = _clamp(KP_ANG * err, MAX_ANG)
+        if abs(vel) < SCAN_MIN_VEL:
+            vel = math.copysign(SCAN_MIN_VEL, vel)
+        t = Twist()
+        t.angular.z = vel
+        self._pub_vel.publish(t)
+
+    def _finish_turn(self):
+        self._pub_vel.publish(Twist())
+        self._state = S.FINISHED
+        self._pub_turned.publish(Bool(data=True))
+        self.get_logger().info(
+            f'\n{"="*55}\n'
+            f'  Sequence complete — robot turned around.\n'
+            f'  /robot_turned_around published; cmd_vel released.\n'
+            f'  The next script can take over now.\n'
+            f'{"="*55}'
+        )
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Failsafe handling
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _fail(self, reason: str):
+        self._pub_vel.publish(Twist())
+        self._pos_left = self._pos_right = None
+        self._fresh_both = False
+        self._state = S.FAILED
+        self._pub_failed.publish(Bool(data=True))
+        self.get_logger().error(
+            f'\n{"="*55}\n'
+            f'  NAVIGATION FAILED: {reason}\n'
+            f'  Robot stopped, /navigation_failed published.\n'
+            f'  Auto-resumes if both markers come back into view.\n'
+            f'{"="*55}'
+        )
+
+    def _do_failed(self):
+        self._pub_vel.publish(Twist())
+        if self._fresh_both and self._both_found:
+            self.get_logger().info('Markers re-acquired — resuming navigation.')
+            self._pub_failed.publish(Bool(data=False))
+            self._compute_target()
+            self._fresh_both = False
+            self._enter_drive()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Small helpers
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _reset_search(self):
+        self._search_t     = time.monotonic()
+        self._sweep_center = None
+        self._sweep_dir    = -1
+        self._sweep_until  = 0.0
+        self._sweep_timed_started = False
+
+    def _enter_drive(self):
+        self._drive_start_t = time.monotonic()
+        self._state = S.DRIVE
 
     # ─────────────────────────────────────────────────────────────────────────
     # Continuous pose publisher  (5 Hz)
@@ -800,7 +1043,7 @@ class MarkerNavigator(Node):
         p.header.stamp       = stamp
         p.pose.position.x    = float(xy[0])
         p.pose.position.y    = float(xy[1])
-        p.pose.position.z    = self._marker_z   # known physical height
+        p.pose.position.z    = self._marker_z
         p.pose.orientation.x = float(quat[0])
         p.pose.orientation.y = float(quat[1])
         p.pose.orientation.z = float(quat[2])
