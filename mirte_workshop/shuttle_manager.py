@@ -31,6 +31,8 @@ from geometry_msgs.msg import PoseStamped, Twist
 from nav2_msgs.action import NavigateToPose
 from action_msgs.msg import GoalStatus
 from std_msgs.msg import Bool, String
+from std_srvs.srv import Trigger
+from visualization_msgs.msg import MarkerArray
 from rclpy.parameter import Parameter
 from rcl_interfaces.srv import SetParameters
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
@@ -139,6 +141,27 @@ class ShuttleManager(Node):
         self._box_proc = None         # the spawned box_placer process
         self._start_placing_sent = False
 
+        # Handle grasp at Zone A (mirte_perception).  When grasp_at_a is True:
+        # on reaching A the shuttle SPAWNS `ros2 launch mirte_perception
+        # grasp.launch.py` (perception_node = YOLO handle detection +
+        # grasp_node = the /grasp_handle Trigger service).  When a handle marker
+        # appears on /perception/object_markers we call /grasp_handle once; the
+        # service visual-servos the BASE and runs the arm itself (30–120 s,
+        # blocking server-side), so the shuttle stays fully idle meanwhile.
+        # When it returns — success OR failure — we kill the stack and proceed
+        # to B.  No handle within grasp_detect_timeout → skip and proceed.
+        self._grasp_at_a = bool(self.declare_parameter('grasp_at_a', False).value)
+        self._grasp_detect_timeout = float(
+            self.declare_parameter('grasp_detect_timeout', 30.0).value)
+        self._grasp_timeout = float(self.declare_parameter('grasp_timeout', 180.0).value)
+        # '' = keep grasp.launch.py's model-path defaults (laptop home layout);
+        # set to the robot's .../mirte_perception/models dir if it differs.
+        self._grasp_models_dir = str(self.declare_parameter('grasp_models_dir', '').value)
+        self._grasping = False        # at A, yielded to mirte_perception's grasp
+        self._grasp_called = False    # /grasp_handle already fired this visit
+        self._grasp_proc = None       # the spawned grasp.launch process
+        self._grasp_start_ns = 0
+
         # Arm choreography around the dock (only in dock_at_b mode):
         #  - at A: move the arm to the box-grabbing pose (default = box_placer's
         #    carry pose; set arm_grab_angles to your real grab pose).
@@ -187,6 +210,14 @@ class ShuttleManager(Node):
         self.create_subscription(String, '/box_placed', self._box_placed_cb, 10)
         # Auto-trigger box_placer once the dock is reached (its manual trigger).
         self._start_placing_pub = self.create_publisher(Bool, '/start_placing', 10)
+
+        # Handle grasp at A: perception_node publishes handle detections as
+        # MarkerArray (ns 'model1_sphere'); the first fresh one triggers ONE
+        # async /grasp_handle call (the service itself requires a <3 s-old
+        # detection, so call-on-detection is exactly its contract).
+        self.create_subscription(MarkerArray, '/perception/object_markers',
+                                 self._markers_cb, 10)
+        self._grasp_cli = self.create_client(Trigger, '/grasp_handle')
 
         # Per-leg inflation: raw SetParameters service clients to the two costmaps.
         self._infl_clients = []
@@ -447,6 +478,29 @@ class ShuttleManager(Node):
                     self.get_logger().info('Docking — marker_navigator adjusting…',
                                            throttle_duration_sec=5.0)
                 return
+            if self._grasping:
+                # mirte_perception owns the base + arm during the handle grasp.
+                # We wait for the /grasp_handle response (handled in
+                # _grasp_done_cb) — or bail out on the guards below.
+                elapsed = (now - self._grasp_start_ns) / 1e9
+                if self._grasp_proc is None or self._grasp_proc.poll() is not None:
+                    self.get_logger().warn('Grasp stack exited — proceeding without grasp.')
+                    self._finish_grasp()
+                elif not self._grasp_called and elapsed > self._grasp_detect_timeout:
+                    self.get_logger().warn(
+                        f'No handle detected in {self._grasp_detect_timeout:.0f} s — '
+                        'skipping grasp, proceeding to B.')
+                    self._finish_grasp()
+                elif elapsed > self._grasp_timeout:
+                    self.get_logger().warn('Grasp timeout — killing grasp stack, proceeding.')
+                    self._finish_grasp()
+                else:
+                    self.get_logger().info(
+                        'Grasping at A — ' +
+                        ('waiting for /grasp_handle to finish…' if self._grasp_called
+                         else 'waiting for a handle detection…'),
+                        throttle_duration_sec=5.0)
+                return
             if self._navigating:
                 if (now - self._goal_sent_ns) / 1e9 > self._goal_timeout:
                     self.get_logger().warn('Goal timeout — cancelling & retrying.')
@@ -584,6 +638,18 @@ class ShuttleManager(Node):
                 self._dock_start_ns = self.get_clock().now().nanoseconds
                 self._spawn_dock()
                 return
+            if zone == 'A' and self._grasp_at_a:
+                # HANDLE GRASP: spawn mirte_perception (YOLO detection + the
+                # /grasp_handle service).  The first handle detection triggers
+                # the service; on its response — success or not — we proceed.
+                # grasp_node owns the arm AND base meanwhile, so no canned
+                # arm pose here and no leg advance until _finish_grasp().
+                self.get_logger().info('Zone A reached — starting handle grasp.')
+                self._grasping = True
+                self._grasp_called = False
+                self._grasp_start_ns = self.get_clock().now().nanoseconds
+                self._spawn_grasp()
+                return
             if self._dock_at_b:
                 # Reached A (B is handled above): move the arm to the box-grabbing
                 # pose for the carry to B.  box_placer isn't running here (cleared
@@ -682,12 +748,14 @@ class ShuttleManager(Node):
                 proc.kill()
 
     def _kill_dock(self):
-        """Stop BOTH dock procs (used to clear leftovers before a fresh dock and
-        on shutdown)."""
+        """Stop ALL spawned helper procs (used to clear leftovers before a fresh
+        dock and on shutdown) — marker_navigator, box_placer, and the grasp stack."""
         self._kill_proc(self._dock_proc)
         self._kill_proc(self._box_proc)
+        self._kill_proc(self._grasp_proc)
         self._dock_proc = None
         self._box_proc = None
+        self._grasp_proc = None
         try:
             self._cmd.publish(Twist())  # stop the base after handoff
         except Exception:
@@ -729,6 +797,62 @@ class ShuttleManager(Node):
             self.get_logger().info(
                 'Walk-back done (/robot_backed_up) — resuming shuttle to A.')
             self._finish_dock()
+
+    # ── handle grasp at A: spawn / kill mirte_perception ───────────────────────
+    def _spawn_grasp(self):
+        """Launch mirte_perception's grasp stack (perception_node + grasp_node)
+        for this A visit.  Spawned fresh each time and killed on finish, so its
+        YOLO load and base-driving only exist while we're parked at A."""
+        self._kill_proc(self._grasp_proc)     # clear any leftover first
+        cmd = ['ros2', 'launch', 'mirte_perception', 'grasp.launch.py']
+        if self._grasp_models_dir:
+            d = self._grasp_models_dir
+            cmd += [f'model1_path:={d}/handles_model.pt',
+                    f'model2_path:={d}/boxes_model.pt',
+                    f'gripper_model_path:={d}/gripper_model.pt']
+        self.get_logger().info('Spawning: ' + ' '.join(cmd))
+        self._grasp_proc = subprocess.Popen(cmd)
+
+    def _finish_grasp(self):
+        """Grasp done / skipped / timed out: kill the perception stack to free
+        the base + arm, and proceed with the mission (A leg complete → B)."""
+        self._kill_proc(self._grasp_proc)
+        self._grasp_proc = None
+        self._grasping = False
+        self._grasp_called = False
+        try:
+            self._cmd.publish(Twist())     # make sure the base is stopped
+        except Exception:
+            pass
+        self._leg += 1                     # Zone A leg complete → next leg is B
+
+    def _markers_cb(self, msg: MarkerArray):
+        """First handle detection while grasping → fire /grasp_handle ONCE.
+        (grasp_node requires a <3 s-old detection, so call-on-detection is its
+        intended trigger.)"""
+        if not (self._grasping and not self._grasp_called):
+            return
+        if not any(m.ns == 'model1_sphere' for m in msg.markers):
+            return
+        if not self._grasp_cli.service_is_ready():
+            return                          # grasp_node still starting — next marker retries
+        self.get_logger().info('Handle detected — calling /grasp_handle.')
+        self._grasp_called = True
+        self._grasp_cli.call_async(Trigger.Request()).add_done_callback(
+            self._grasp_done_cb)
+
+    def _grasp_done_cb(self, fut):
+        """/grasp_handle returned — proceed with the mission either way."""
+        if not self._grasping:
+            return                          # already timed out / finished
+        try:
+            res = fut.result()
+            self.get_logger().info(
+                f'Grasp finished: success={res.success} ({res.message}) — '
+                'proceeding to B.')
+        except Exception as e:
+            self.get_logger().warn(f'/grasp_handle call failed: {e} — proceeding.')
+        self._finish_grasp()
 
     # ── arm choreography ──────────────────────────────────────────────────────
     def _arm_traj(self, angles):

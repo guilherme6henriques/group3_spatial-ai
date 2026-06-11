@@ -47,6 +47,10 @@ def generate_launch_description():
     dock_cmd_vel_topic = LaunchConfiguration('dock_cmd_vel_topic')
     dock_approach_m    = LaunchConfiguration('dock_approach_m')
     dock_seek_dist     = LaunchConfiguration('dock_seek_dist')
+    grasp_at_a           = LaunchConfiguration('grasp_at_a')
+    grasp_detect_timeout = LaunchConfiguration('grasp_detect_timeout')
+    grasp_timeout        = LaunchConfiguration('grasp_timeout')
+    grasp_models_dir     = LaunchConfiguration('grasp_models_dir')
     cmd_vel_topic = LaunchConfiguration('cmd_vel_topic')
     image_topic   = LaunchConfiguration('image_topic')
     camera_info_topic = LaunchConfiguration('camera_info_topic')
@@ -90,6 +94,16 @@ def generate_launch_description():
         # < 0 → keep marker_navigator's own defaults (approach 0.40 / seek 0.22).
         DeclareLaunchArgument('dock_approach_m',    default_value='-1.0'),
         DeclareLaunchArgument('dock_seek_dist',     default_value='-1.0'),
+        # Handle grasp at A (mirte_perception): on reaching A, spawn
+        # perception_node + grasp_node, call /grasp_handle on the first handle
+        # detection, and proceed to B when it returns (success or not).
+        # Default false — sim has no YOLO models; the real-robot mission enables it.
+        DeclareLaunchArgument('grasp_at_a',           default_value='false'),
+        DeclareLaunchArgument('grasp_detect_timeout', default_value='30.0'),
+        DeclareLaunchArgument('grasp_timeout',        default_value='180.0'),
+        # '' = grasp.launch.py's own model-path defaults; set if the robot's
+        # mirte_perception/models dir lives elsewhere.
+        DeclareLaunchArgument('grasp_models_dir',     default_value=''),
         # Distance (m) from the marker to the robot CENTRE at the approach
         # standoff.  Front bumper is ~0.20 m ahead of base_link, so 0.1 m puts
         # the robot's front right up against the marker.  Override here instead of
@@ -290,6 +304,10 @@ def generate_launch_description():
                                    'dock_cmd_vel_topic': dock_cmd_vel_topic,
                                    'dock_approach_m': dock_approach_m,
                                    'dock_seek_dist': dock_seek_dist,
+                                   'grasp_at_a': grasp_at_a,
+                                   'grasp_detect_timeout': grasp_detect_timeout,
+                                   'grasp_timeout': grasp_timeout,
+                                   'grasp_models_dir': grasp_models_dir,
                                    'cmd_vel_topic': cmd_vel_topic}]),
         ]),
     ])

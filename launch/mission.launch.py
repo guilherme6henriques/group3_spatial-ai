@@ -31,6 +31,8 @@ def generate_launch_description():
     publish_odom_tf   = LaunchConfiguration('publish_odom_tf')
     dock_wait_for_box = LaunchConfiguration('dock_wait_for_box')
     use_depth_scan    = LaunchConfiguration('use_depth_scan')
+    grasp_at_a        = LaunchConfiguration('grasp_at_a')
+    grasp_models_dir  = LaunchConfiguration('grasp_models_dir')
 
     shuttle = PathJoinSubstitution([
         FindPackageShare('mirte_workshop'), 'launch', 'shuttle.launch.py'])
@@ -49,6 +51,14 @@ def generate_launch_description():
         # Real lidar is back → use it. Set true ONLY on a unit with no lidar
         # (synthesizes /scan from the depth camera; would double-publish otherwise).
         DeclareLaunchArgument('use_depth_scan', default_value='false'),
+        # Handle grasp at A (mirte_perception): spawn perception+grasp on each A
+        # arrival, call /grasp_handle on the first handle detection, proceed to B
+        # when it returns (success or not).  grasp_at_a:=false to skip entirely.
+        DeclareLaunchArgument('grasp_at_a', default_value='true'),
+        # '' = grasp.launch.py's model defaults (~/spatial-ai/ws/src/mirte-ros-
+        # packages/mirte_perception/models).  If the robot's models live under a
+        # different path, e.g. ~/mirte_ws/src/..., point this at that models dir.
+        DeclareLaunchArgument('grasp_models_dir', default_value=''),
 
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource([shuttle]),
@@ -69,6 +79,8 @@ def generate_launch_description():
                 'zone_b_right_id':   '102',
                 'zone_marker_size':  '0.08',
                 'dock_at_b':         'true',
+                'grasp_at_a':        grasp_at_a,
+                'grasp_models_dir':  grasp_models_dir,
                 'image_topic':       '/camera/color/image_raw',
                 'camera_info_topic': '/camera/color/camera_info',
                 'cmd_vel_topic':     '/mirte_base_controller/cmd_vel',
