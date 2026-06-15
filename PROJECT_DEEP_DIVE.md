@@ -196,9 +196,9 @@ The BT navigator uses an XML tree to describe what to do when navigation fails. 
 ├── src/                         ← all source packages live here
 │   ├── mirte-ros-packages/      ← robot hardware & description (DO NOT MODIFY)
 │   ├── mirte-gazebo/            ← Gazebo simulation world (YOU MODIFIED)
-│   ├── mirte_navigation/        ← YOUR navigation package
-│   ├── mirte_workshop/          ← YOUR mission logic package
-│   ├── m-explore-ros2/          ← frontier exploration library (dependency, not used)
+│   ├── mirte_navigation/        ← Navigation packages
+│   ├── mirte_workshop/          ← Mission logic packages
+│   ├── m-explore-ros2/          ← frontier exploration library (dependency)
 │   ├── gazebo_grasp_fix/        ← gripper physics plugin (dependency)
 │   └── mirte_location_markers/  ← location service helper (not used)
 ├── build/                       ← colcon build output (auto-generated, gitignore)
